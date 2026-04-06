@@ -4,7 +4,7 @@ import argparse
 import queue
 import threading
 import tkinter as tk
-from tkinter import messagebox, ttk
+from tkinter import ttk
 from tkinter.scrolledtext import ScrolledText
 from typing import Any
 
@@ -12,8 +12,6 @@ from crafter_engine import (
     CrafterData,
     CraftSelection,
     WEAPON_TYPES,
-    build_copy_long,
-    build_copy_short,
     format_craft_summary,
     format_ingredient_summary,
     format_recipe_summary,
@@ -302,7 +300,6 @@ class WynnCrafterApp(tk.Tk):
 
         self.recipe_var = tk.StringVar()
         self.level_var = tk.StringVar()
-        self.hash_var = tk.StringVar()
         self.attack_speed_var = tk.StringVar(value="NORMAL")
         self.mat_vars = [tk.IntVar(value=3), tk.IntVar(value=3)]
         self.ingredient_vars = [tk.StringVar(value="No Ingredient") for _ in range(6)]
@@ -428,14 +425,6 @@ class WynnCrafterApp(tk.Tk):
         level_combo.grid(row=1, column=1, sticky="ew")
         self._bind_recipe_widget(level_combo)
 
-        ttk.Label(recipe_frame, text="Hash").grid(row=2, column=0, sticky="w")
-        hash_entry = ttk.Entry(recipe_frame, textvariable=self.hash_var, width=26)
-        hash_entry.grid(row=2, column=1, sticky="ew")
-        hash_entry.bind("<Return>", self._load_hash)
-
-        load_hash = ttk.Button(recipe_frame, text="Load Hash", command=self._load_hash)
-        load_hash.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(6, 0))
-
         material_frame = ttk.LabelFrame(parent, text="Materials", style="Section.TLabelframe")
         material_frame.grid(row=1, column=0, sticky="ew", pady=(10, 0))
 
@@ -484,13 +473,9 @@ class WynnCrafterApp(tk.Tk):
 
         button_frame = ttk.Frame(parent)
         button_frame.grid(row=4, column=0, sticky="ew", pady=(10, 0))
-        for col in range(4):
-            button_frame.columnconfigure(col, weight=1)
+        button_frame.columnconfigure(0, weight=1)
 
         ttk.Button(button_frame, text="Reset", command=self._reset).grid(row=0, column=0, sticky="ew")
-        ttk.Button(button_frame, text="Copy Hash", command=self._copy_hash).grid(row=0, column=1, sticky="ew")
-        ttk.Button(button_frame, text="Copy Short", command=self._copy_short).grid(row=0, column=2, sticky="ew")
-        ttk.Button(button_frame, text="Copy Long", command=self._copy_long).grid(row=0, column=3, sticky="ew")
 
         self._build_generator_controls(parent)
 
@@ -928,7 +913,6 @@ class WynnCrafterApp(tk.Tk):
         lines = [
             f"{option.objective_label}: {format_number(option.objective_value)}",
             f"Roll Mode: {option.roll_mode.title()}",
-            f"Hash: {result.prefixed_hash}",
             "",
             f"Health: {format_number(self.optimizer.metric_value_from_result(result, 'hp', option.roll_mode))}",
             f"Durability: {format_number(self.optimizer.metric_value_from_result(result, 'durability', option.roll_mode))}",
@@ -1064,12 +1048,6 @@ class WynnCrafterApp(tk.Tk):
         summary = f"{format_recipe_summary(result)}\n\n{format_craft_summary(result)}"
         self._set_text(self.summary_text, summary)
         self._set_text(self.ingredient_text, format_ingredient_summary(result))
-
-        self._suspend_updates = True
-        try:
-            self.hash_var.set(result.prefixed_hash)
-        finally:
-            self._suspend_updates = False
         self.status_var.set("Craft updated.")
 
     def _set_text(self, widget: ScrolledText, text: str) -> None:
@@ -1078,44 +1056,9 @@ class WynnCrafterApp(tk.Tk):
         widget.insert("1.0", text)
         widget.configure(state="disabled")
 
-    def _load_hash(self, _event=None):
-        try:
-            selection = self.data.decode_hash_to_selection(self.hash_var.get())
-        except Exception as exc:
-            self.status_var.set(str(exc))
-            messagebox.showerror("Invalid hash", str(exc), parent=self)
-            return "break"
-        self._apply_selection(selection, recalculate=True)
-        self.status_var.set("Hash loaded.")
-        return "break"
-
     def _reset(self) -> None:
-        self.hash_var.set("")
         self._apply_selection(self.data.default_selection(), recalculate=True)
         self.status_var.set("Reset to defaults.")
-
-    def _copy_text(self, text: str, message: str) -> None:
-        if not text:
-            return
-        self.clipboard_clear()
-        self.clipboard_append(text)
-        self.update()
-        self.status_var.set(message)
-
-    def _copy_hash(self) -> None:
-        if self.current_result is None:
-            return
-        self._copy_text(self.current_result.prefixed_hash, "Hash copied.")
-
-    def _copy_short(self) -> None:
-        if self.current_result is None:
-            return
-        self._copy_text(build_copy_short(self.current_result), "Short share text copied.")
-
-    def _copy_long(self) -> None:
-        if self.current_result is None:
-            return
-        self._copy_text(build_copy_long(self.current_result), "Long share text copied.")
 
 
 def run_self_test() -> None:
@@ -1123,11 +1066,6 @@ def run_self_test() -> None:
     optimizer = CrafterOptimizer(data)
 
     default_result = data.craft(data.default_selection())
-    decoded_default = data.decode_hash_to_selection(default_result.prefixed_hash)
-    assert decoded_default.recipe_name == default_result.selection.recipe_name
-    assert decoded_default.level_range == default_result.selection.level_range
-    assert decoded_default.mat_tiers == default_result.selection.mat_tiers
-    assert decoded_default.ingredient_names == default_result.selection.ingredient_names
 
     weapon_selection = CraftSelection(
         recipe_name="Bow",
@@ -1144,8 +1082,6 @@ def run_self_test() -> None:
         attack_speed="FAST",
     )
     weapon_result = data.craft(weapon_selection)
-    decoded_weapon = data.decode_hash_to_selection(weapon_result.prefixed_hash)
-    assert decoded_weapon == weapon_result.selection
 
     search_selection = CraftSelection(
         recipe_name="Bow",
@@ -1193,11 +1129,11 @@ def run_self_test() -> None:
 
     print("Loaded recipes:", len(data.recipes))
     print("Loaded ingredients:", len(data.ingredients))
-    print("Default hash:", default_result.prefixed_hash)
-    print("Weapon hash:", weapon_result.prefixed_hash)
-    print("Exact best:", exact_options[0].result.prefixed_hash)
-    print("MCTS best:", mcts_options[0].result.prefixed_hash)
-    print("Armor exact best:", armor_exact_options[0].result.prefixed_hash)
+    print("Default recipe:", default_result.recipe.display_type, default_result.recipe.level_range)
+    print("Weapon recipe:", weapon_result.recipe.display_type, weapon_result.recipe.level_range)
+    print("Exact best objective:", format_number(exact_options[0].objective_value))
+    print("MCTS best objective:", format_number(mcts_options[0].objective_value))
+    print("Armor exact best objective:", format_number(armor_exact_options[0].objective_value))
     print("Self-test passed.")
 
 

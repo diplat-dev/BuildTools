@@ -10,9 +10,6 @@ from typing import Iterable
 ROOT = Path(__file__).resolve().parent
 DATA_DIR = ROOT / "data"
 
-BASE64_DIGITS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz+-"
-BASE64_MAP = {char: idx for idx, char in enumerate(BASE64_DIGITS)}
-
 SITE_RECIPE_ORDER = [
     "HELMET",
     "CHESTPLATE",
@@ -93,13 +90,6 @@ WEAPON_TYPES = {"wand", "spear", "bow", "dagger", "relik"}
 CONSUMABLE_TYPES = {"potion", "scroll", "food"}
 
 CRAFTED_ATK_SPEED = {"SLOW": 0, "NORMAL": 1, "FAST": 2}
-CRAFTED_ATK_SPEED_ID = {value: key for key, value in CRAFTED_ATK_SPEED.items()}
-CRAFTED_ENCODING_VERSION = 2
-CRAFTED_VERSION_BITLEN = 7
-ING_ID_BITLEN = 12
-RECIPE_ID_BITLEN = 12
-MAT_TIER_BITLEN = 3
-ATK_SPEED_BITLEN = 4
 
 ROLLED_IDS = [
     "hprPct",
@@ -328,7 +318,6 @@ class Ingredient:
     item_ids: dict[str, float]
     consumable_ids: dict[str, int]
     pos_mods: dict[str, int]
-    ingredient_id: int
     is_powder: bool = False
     pid: int | None = None
 
@@ -352,7 +341,6 @@ class Ingredient:
             item_ids={key: float(value) for key, value in raw.get("itemIDs", {}).items()},
             consumable_ids={key: int(value) for key, value in raw.get("consumableIDs", {}).items()},
             pos_mods={key: int(value) for key, value in raw.get("posMods", {}).items()},
-            ingredient_id=int(raw.get("id", 0) or 0),
             is_powder=bool(raw.get("isPowder", False)),
             pid=raw.get("pid"),
         )
@@ -361,7 +349,6 @@ class Ingredient:
 @dataclass(frozen=True)
 class Recipe:
     name: str
-    recipe_id: int
     type_name: str
     skill: str
     materials: tuple[Material, Material]
@@ -392,7 +379,6 @@ class Recipe:
         materials = tuple(Material(item=entry["item"], amount=int(entry["amount"])) for entry in raw["materials"])
         return cls(
             name=raw["name"],
-            recipe_id=int(raw["id"]),
             type_name=raw["type"],
             skill=raw["skill"],
             materials=(materials[0], materials[1]),
@@ -419,61 +405,9 @@ class CraftResult:
     recipe: Recipe
     ingredients: list[Ingredient]
     stat_map: dict
-    hash_value: str
     warnings: list[str]
     ingredient_effectiveness: list[int]
     damage_rows: list[tuple[str, str, str]]
-
-    @property
-    def prefixed_hash(self) -> str:
-        return f"CR-{self.hash_value}"
-
-
-class BitWriter:
-    def __init__(self) -> None:
-        self.bits: list[int] = []
-
-    def append(self, value: int, bit_length: int) -> None:
-        if bit_length < 0:
-            raise ValueError("bit length must be non-negative")
-        for idx in range(bit_length):
-            self.bits.append((value >> idx) & 1)
-
-    def to_b64(self) -> str:
-        chars: list[str] = []
-        for start in range(0, len(self.bits), 6):
-            chunk = self.bits[start : start + 6]
-            value = 0
-            for idx, bit in enumerate(chunk):
-                value |= bit << idx
-            chars.append(BASE64_DIGITS[value])
-        return "".join(chars)
-
-
-class BitReader:
-    def __init__(self, b64_text: str) -> None:
-        self.bits: list[int] = []
-        for char in b64_text:
-            if char not in BASE64_MAP:
-                raise ValueError(f"invalid base64 character: {char!r}")
-            value = BASE64_MAP[char]
-            for idx in range(6):
-                self.bits.append((value >> idx) & 1)
-        self.index = 0
-
-    def read(self, bit_length: int = 1) -> int:
-        if self.index + bit_length > len(self.bits):
-            raise ValueError("hash ended unexpectedly")
-        value = 0
-        for idx in range(bit_length):
-            value |= self.bits[self.index + idx] << idx
-        self.index += bit_length
-        return value
-
-    def skip(self, bit_length: int) -> None:
-        if self.index + bit_length > len(self.bits):
-            raise ValueError("hash ended unexpectedly")
-        self.index += bit_length
 
 
 class CrafterData:
@@ -482,13 +416,11 @@ class CrafterData:
         self.recipes = list(recipes)
 
         self.ingredients_by_name = {ingredient.display_name: ingredient for ingredient in self.ingredients}
-        self.ingredients_by_id = {ingredient.ingredient_id: ingredient for ingredient in self.ingredients}
         self.ingredients_by_name_casefold = {
             ingredient.display_name.casefold(): ingredient.display_name for ingredient in self.ingredients
         }
 
         self.recipes_by_name = {recipe.name: recipe for recipe in self.recipes}
-        self.recipes_by_id = {recipe.recipe_id: recipe for recipe in self.recipes}
         self.recipe_names_casefold = {recipe.name.casefold(): recipe.name for recipe in self.recipes}
 
         self.ingredient_display_names = sorted(
@@ -572,11 +504,6 @@ class CrafterData:
             raise ValueError(f"Invalid attack speed: {selection.attack_speed}")
 
         stat_map = self._build_stat_map(recipe, ingredients, mat_tiers, attack_speed)
-        hash_value = self.encode_hash(recipe, ingredients, mat_tiers, attack_speed, stat_map["category"])
-        stat_map["name"] = f"CR-{hash_value}"
-        stat_map["displayName"] = f"CR-{hash_value}"
-        stat_map["hash"] = f"CR-{hash_value}"
-
         warnings = self._build_warnings(recipe, ingredients)
         ingredient_effectiveness = list(stat_map.get("ingredEffectiveness", [100] * 6))
         damage_rows = self._build_damage_rows(stat_map)
@@ -593,87 +520,9 @@ class CrafterData:
             recipe=recipe,
             ingredients=ingredients,
             stat_map=stat_map,
-            hash_value=hash_value,
             warnings=warnings,
             ingredient_effectiveness=ingredient_effectiveness,
             damage_rows=damage_rows,
-        )
-
-    def encode_hash(
-        self,
-        recipe: Recipe,
-        ingredients: list[Ingredient],
-        mat_tiers: tuple[int, int],
-        attack_speed: str,
-        category: str,
-    ) -> str:
-        writer = BitWriter()
-        writer.append(0, 1)
-        writer.append(CRAFTED_ENCODING_VERSION, CRAFTED_VERSION_BITLEN)
-        for ingredient in ingredients:
-            writer.append(ingredient.ingredient_id, ING_ID_BITLEN)
-        writer.append(recipe.recipe_id, RECIPE_ID_BITLEN)
-        for tier in mat_tiers:
-            writer.append(tier - 1, MAT_TIER_BITLEN)
-        if category == "weapon":
-            writer.append(CRAFTED_ATK_SPEED[attack_speed], ATK_SPEED_BITLEN)
-        pad_bits = 6 - (len(writer.bits) % 6)
-        writer.append(0, pad_bits)
-        return writer.to_b64()
-
-    def decode_hash_to_selection(self, hash_text: str) -> CraftSelection:
-        normalized = normalize_hash(hash_text)
-        if not normalized:
-            raise ValueError("Hash is empty")
-        if BASE64_MAP[normalized[0]] & 0x1:
-            return self._decode_legacy_hash(normalized)
-
-        reader = BitReader(normalized)
-        legacy = reader.read(1)
-        if legacy:
-            return self._decode_legacy_hash(normalized)
-
-        _version = reader.read(CRAFTED_VERSION_BITLEN)
-        ingredients = [self.ingredients_by_id[reader.read(ING_ID_BITLEN)].display_name for _ in range(6)]
-        recipe = self.recipes_by_id[reader.read(RECIPE_ID_BITLEN)]
-        mat_tiers = tuple(reader.read(MAT_TIER_BITLEN) + 1 for _ in range(2))
-        attack_speed = "SLOW"
-        if recipe.type_key in WEAPON_TYPES:
-            attack_speed_id = reader.read(ATK_SPEED_BITLEN)
-            attack_speed = CRAFTED_ATK_SPEED_ID.get(attack_speed_id, "SLOW")
-        padding = 6 - (reader.index % 6)
-        reader.skip(padding)
-        return CraftSelection(
-            recipe_name=recipe.display_type,
-            level_range=recipe.level_range,
-            mat_tiers=mat_tiers,
-            ingredient_names=tuple(ingredients),
-            attack_speed=attack_speed,
-        )
-
-    def _decode_legacy_hash(self, normalized_hash: str) -> CraftSelection:
-        if len(normalized_hash) < 17:
-            raise ValueError("Legacy craft hash is too short")
-        version = normalized_hash[0]
-        if version != "1":
-            raise ValueError(f"Unsupported legacy craft version: {version}")
-        payload = normalized_hash[1:]
-        ingredients = [
-            self.ingredients_by_id[b64_to_int(payload[2 * idx : 2 * idx + 2])].display_name
-            for idx in range(6)
-        ]
-        recipe = self.recipes_by_id[b64_to_int(payload[12:14])]
-        tier_num = b64_to_int(payload[14:15])
-        mat_1 = 3 if tier_num % 3 == 0 else tier_num % 3
-        mat_2 = math.floor((tier_num - 0.5) / 3) + 1
-        attack_speed_id = b64_to_int(payload[15:16])
-        attack_speed = ["SLOW", "NORMAL", "FAST"][attack_speed_id]
-        return CraftSelection(
-            recipe_name=recipe.display_type,
-            level_range=recipe.level_range,
-            mat_tiers=(mat_1, mat_2),
-            ingredient_names=tuple(ingredients),
-            attack_speed=attack_speed,
         )
 
     def _build_warnings(self, recipe: Recipe, ingredients: list[Ingredient]) -> list[str]:
@@ -699,8 +548,6 @@ class CrafterData:
         stat_map: dict = {
             "minRolls": {},
             "maxRolls": {},
-            "name": "CR-",
-            "displayName": "CR-",
             "tier": "Crafted",
             "type": recipe.type_key,
             "duration": [recipe.duration[0], recipe.duration[1]],
@@ -1094,29 +941,6 @@ def build_powder_ingredients() -> list[Ingredient]:
             raw["itemIDs"][f"{SKP_ORDER[element_idx]}Req"] = req_delta
             ingredients.append(Ingredient.from_raw(raw))
     return ingredients
-
-
-def normalize_hash(hash_text: str) -> str:
-    normalized = hash_text.strip()
-    if normalized.startswith("#"):
-        normalized = normalized[1:]
-    if normalized.startswith("CR-"):
-        normalized = normalized[3:]
-    if not normalized:
-        return ""
-    for char in normalized:
-        if char not in BASE64_MAP:
-            raise ValueError(f"Hash contains an invalid character: {char!r}")
-    return normalized
-
-
-def b64_to_int(text: str) -> int:
-    value = 0
-    for char in text:
-        value = (value << 6) + BASE64_MAP[char]
-    return value
-
-
 def title_case(value: str) -> str:
     return value[:1] + value[1:].lower() if value else value
 
@@ -1222,7 +1046,6 @@ def format_recipe_summary(result: CraftResult) -> str:
 def format_craft_summary(result: CraftResult) -> str:
     stat_map = result.stat_map
     lines = [
-        f"Hash: {result.prefixed_hash}",
         f"Category: {title_case(stat_map['category'])}",
         f"Type: {title_case(stat_map['type'])}",
         f"Level: {stat_map['lvlLow']}-{stat_map['lvl']}",
@@ -1349,25 +1172,3 @@ def format_ingredient_summary(result: CraftResult) -> str:
 
         sections.append("\n".join(lines))
     return "\n\n".join(sections)
-
-
-def build_copy_short(result: CraftResult) -> str:
-    ingredients = " | ".join(result.selection.ingredient_names)
-    return (
-        f"{result.recipe.display_type} {result.recipe.level_range} "
-        f"({result.selection.mat_tiers[0]}*, {result.selection.mat_tiers[1]}*) "
-        f"| {ingredients} | {result.prefixed_hash}"
-    )
-
-
-def build_copy_long(result: CraftResult) -> str:
-    ingredient_names = list(result.selection.ingredient_names)
-    return "\n".join(
-        [
-            result.prefixed_hash,
-            f"> {result.recipe.display_type} Lv. {result.recipe.level_range} ({result.selection.mat_tiers[0]}*, {result.selection.mat_tiers[1]}*)",
-            f"> [{ingredient_names[0]} | {ingredient_names[1]}",
-            f">  {ingredient_names[2]} | {ingredient_names[3]}",
-            f">  {ingredient_names[4]} | {ingredient_names[5]}]",
-        ]
-    )

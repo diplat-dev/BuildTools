@@ -34,6 +34,9 @@ htmlcov/
 !.env.example
 .python-version
 
+# Local data refresh artifacts
+_live_ingredients_raw.json
+
 # Editors / OS
 .vscode/
 .idea/
