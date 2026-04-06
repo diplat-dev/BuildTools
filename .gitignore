@@ -35,7 +35,7 @@ htmlcov/
 .python-version
 
 # Local data refresh artifacts
-_live_ingredients_raw.json
+_live_*_raw.json
 
 # Editors / OS
 .vscode/
