@@ -4,8 +4,9 @@ BuildTools is a small collection of standalone Python desktop utilities for Wynn
 
 - [`WynnBuilder`](./WynnBuilder/) for build selection, validation, damage/stat summaries, and build generation
 - [`WynnCrafter`](./WynnCrafter/) for offline crafted-item simulation, share-hash import/export, and craft optimization
+- [`ItemFinder`](./ItemFinder/) for Wynnbuilder-style browsing, filtering, and sorting of items and ingredients
 
-Both tools are local-first and ship with the JSON data they need to run.
+All tools are local-first and ship with the JSON data they need to run.
 
 ## Requirements
 
@@ -22,6 +23,7 @@ From the repository root on Windows:
 ```powershell
 .\run_wynnbuilder.bat
 .\run_wynncrafter.bat
+.\run_itemfinder.bat
 ```
 
 You can also launch the applications directly:
@@ -29,6 +31,7 @@ You can also launch the applications directly:
 ```powershell
 python .\WynnBuilder\build_tester.py
 python .\WynnCrafter\app.py
+python .\ItemFinder\app.py
 ```
 
 ## Verification
@@ -38,6 +41,7 @@ Each tool includes a built-in headless smoke test:
 ```powershell
 python .\WynnBuilder\build_tester.py --self-test
 python .\WynnCrafter\app.py --self-test
+python .\ItemFinder\app.py --self-test
 ```
 
 ## Configuration
@@ -52,8 +56,12 @@ BuildTools/
   LICENSE
   README.md
   requirements.txt
+  run_itemfinder.bat
   run_wynnbuilder.bat
   run_wynncrafter.bat
+  ItemFinder/
+    README.md
+    app.py
   WynnBuilder/
     README.md
     build_tester.py
@@ -78,6 +86,10 @@ BuildTools/
 ### WynnCrafter
 
 `WynnCrafter` is the offline crafting companion. It supports recipe selection, ingredient slotting, material tiers, weapon attack speed selection, crafted stat summaries, warning output, share-hash import/export, and generator-based craft optimization.
+
+### ItemFinder
+
+`ItemFinder` is the local search browser for vendored WynnBuilder item data and WynnCrafter ingredient data. It uses dataset-specific Wynnbuilder-style search panels, stat-based include/exclude filters, and stat-based sorting with scrollable detail cards.
 
 ## License
 
