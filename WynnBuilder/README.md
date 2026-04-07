@@ -35,6 +35,7 @@ python .\build_tester.py --self-test
 - Summed item stats, active set bonuses, equip-order checking, and non-crafted damage calculations
 - Melee plus a simple spell-damage estimate scaled from the selected weapon's listed DPS
 - A summary view with estimated average melee and spell damage
+  Note: `spell avg damage` is a heuristic metric for approximating relative spell-build effectiveness. It is useful for comparing builds inside the tool, but it does not directly correspond to a single in-game number.
 - A build generator with weighted optimization targets and constraint support using `>`, `<`, or `=`
 - Exact search and MCTS search modes, including a stoppable parallel MCTS workflow
 - Runtime estimation for the current exact-search configuration

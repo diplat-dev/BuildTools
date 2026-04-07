@@ -27,6 +27,8 @@ APP_TITLE = "Wynn Build Tester"
 WINDOW_SIZE = "1440x900"
 DETECTED_LOGICAL_CPUS = max(1, int(os.cpu_count() or 1))
 DEFAULT_MCTS_WORKERS = max(1, DETECTED_LOGICAL_CPUS // 2)
+DEFAULT_COMBAT_LEVEL_FALLBACK = 105
+MAX_COMBAT_LEVEL_INPUT = 200
 
 LIGHT_THEME = {
     "bg": "#f3f5f8",
@@ -534,6 +536,9 @@ def parse_skill_percentages(raw_table: str) -> list[float]:
 
 
 SKILL_PERCENTAGES = parse_skill_percentages(SKILL_PERCENTAGE_TEXT)
+DEFENCE_SKILL_SCALE = 0.867
+AGILITY_SKILL_SCALE = 0.951
+MAX_SCALED_SKILL_PERCENTAGE = SKILL_PERCENTAGES[-1]
 
 
 @dataclass(frozen=True)
@@ -1057,9 +1062,12 @@ class WynnBuildEngine:
         self.item_fact_lookup: dict[str, CandidateFact] = {}
         self.slot_options: dict[str, list[str]] = {slot: [] for slot, _ in SLOT_CONFIGS}
         self.slot_candidate_facts: dict[str, list[CandidateFact]] = {slot: [] for slot, _ in SLOT_CONFIGS}
+        self._slot_option_level_cache: dict[tuple[str, int | None], list[str]] = {}
+        self._slot_candidate_level_cache: dict[tuple[str, int | None], list[CandidateFact]] = {}
         self.item_to_set: dict[str, str] = {}
         self._set_skill_bonuses: dict[str, tuple[tuple[int, int, int, int, int], ...]] = {}
         self._requirement_minima_cache: dict[tuple[str, ...], tuple[tuple[int, int, int, int, int], ...]] = {}
+        self.max_item_level = max((int(item.get("lvl", 0) or 0) for item in self.items), default=0)
 
         for set_name, set_data in self.sets.items():
             for item_name in set_data.get("items", []):
@@ -1102,6 +1110,29 @@ class WynnBuildEngine:
             matching = [fact.label for fact in matching_facts]
             self.slot_candidate_facts[slot_label] = sorted(matching_facts, key=lambda fact: fact.label.casefold())
             self.slot_options[slot_label] = sorted(matching, key=str.casefold)
+
+    def slot_candidate_facts_for_level(self, slot_label: str, max_level: int | None = None) -> list[CandidateFact]:
+        cache_key = (slot_label, None if max_level is None else int(max_level))
+        cached = self._slot_candidate_level_cache.get(cache_key)
+        if cached is not None:
+            return list(cached)
+        source = self.slot_candidate_facts[slot_label]
+        if max_level is None:
+            filtered = list(source)
+        else:
+            safe_level = int(max_level)
+            filtered = [fact for fact in source if fact.level_requirement <= safe_level]
+        self._slot_candidate_level_cache[cache_key] = filtered
+        return list(filtered)
+
+    def slot_options_for_level(self, slot_label: str, max_level: int | None = None) -> list[str]:
+        cache_key = (slot_label, None if max_level is None else int(max_level))
+        cached = self._slot_option_level_cache.get(cache_key)
+        if cached is not None:
+            return list(cached)
+        labels = [fact.label for fact in self.slot_candidate_facts_for_level(slot_label, max_level)]
+        self._slot_option_level_cache[cache_key] = labels
+        return list(labels)
 
     def _build_candidate_fact(self, item: dict[str, Any]) -> CandidateFact:
         totals = {
@@ -1411,7 +1442,7 @@ class WynnBuildEngine:
         strategy = allocation_strategy_for_metric(preferred_metric)
         if strategy == "mana":
             effective_int = allocation[2] + int(totals.get("int", 0.0))
-            return float(effective_int) + (self._skill_percentage(effective_int) / 100.0)
+            return float(effective_int) + (self._skill_effect_percentage("int", effective_int) / 100.0)
         if strategy == "minimal":
             return 0.0
         return self._metric_value_from_parts(preferred_metric, totals, weapon, allocation)
@@ -1672,7 +1703,7 @@ class WynnBuildEngine:
             element: DamageRange.from_string(weapon.get(f"{element}Dam"))
             for element in ELEMENT_ORDER
         }
-        crit_chance = self._skill_percentage(effective_skills["dex"]) / 100.0
+        crit_chance = self._skill_effect_percentage("dex", effective_skills["dex"]) / 100.0
         profiles: dict[str, DamageProfile] = {}
 
         melee_noncrit = self._finish_damage_pipeline(
@@ -1801,22 +1832,27 @@ class WynnBuildEngine:
         generic_percent_key = "mdPct" if attack_type == "melee" else "sdPct"
         rainbow_percent_key = "rMdPct" if attack_type == "melee" else "rSdPct"
         element_percent_suffix = "MdPct" if attack_type == "melee" else "SdPct"
+        critical_bonus = 100.0 + totals.get("critDamPct", 0.0) if crit else 0.0
 
         boost = totals.get("damPct", 0.0) + totals.get(generic_percent_key, 0.0)
-        boost += self._skill_percentage(effective_skills["str"])
+        boost += self._skill_effect_percentage("str", effective_skills["str"])
 
         if element == "n":
             boost += totals.get("nDamPct", 0.0)
             boost += totals.get(f"n{element_percent_suffix}", 0.0)
         else:
+            element_skill = ELEMENT_TO_SKILL[element]
+            elemental_skill_bonus = self._skill_effect_percentage(element_skill, effective_skills[element_skill])
             boost += totals.get("rDamPct", 0.0)
             boost += totals.get(rainbow_percent_key, 0.0)
             boost += totals.get(f"{element}DamPct", 0.0)
             boost += totals.get(f"{element}{element_percent_suffix}", 0.0)
-            boost += self._skill_percentage(effective_skills[ELEMENT_TO_SKILL[element]])
+            boost += elemental_skill_bonus
+            if crit and element == "t" and elemental_skill_bonus > 0.0:
+                boost += (elemental_skill_bonus * critical_bonus) / 100.0
 
         if crit:
-            boost += 100.0 + totals.get("critDamPct", 0.0)
+            boost += critical_bonus
 
         return boost
 
@@ -1846,14 +1882,31 @@ class WynnBuildEngine:
         safe_points = max(0, min(150, int(points)))
         return SKILL_PERCENTAGES[safe_points]
 
+    @classmethod
+    def _skill_effect_percentage(cls, skill: str, points: int) -> float:
+        base_percentage = cls._skill_percentage(points)
+        if skill == "def":
+            return base_percentage * DEFENCE_SKILL_SCALE
+        if skill == "agi":
+            return base_percentage * AGILITY_SKILL_SCALE
+        return base_percentage
+
+    @classmethod
+    def _intelligence_spell_cost_reduction_percentage(cls, points: int) -> float:
+        scaled_intelligence = cls._skill_effect_percentage("int", points)
+        if scaled_intelligence <= 0.0:
+            return 0.0
+        return 50.0 * (scaled_intelligence / MAX_SCALED_SKILL_PERCENTAGE)
+
     def _effective_hp_value(self, totals: dict[str, float], effective_skills: dict[str, int]) -> float:
         base_hp = float(totals.get("hp", 0.0) + totals.get("hpBonus", 0.0))
         if base_hp <= 0:
             return 0.0
 
-        defense_multiplier = max(0.01, 1.0 - (self._skill_percentage(effective_skills["def"]) / 100.0))
-        agility_multiplier = max(0.01, 1.0 - (self._skill_percentage(effective_skills["agi"]) / 100.0))
-        return base_hp / (defense_multiplier * agility_multiplier)
+        defense_reduction = self._skill_effect_percentage("def", effective_skills["def"]) / 100.0
+        dodge_chance = self._skill_effect_percentage("agi", effective_skills["agi"]) / 100.0
+        expected_damage_multiplier = (dodge_chance * 0.1) + ((1.0 - dodge_chance) * (1.0 - defense_reduction))
+        return base_hp / max(1e-9, expected_damage_multiplier)
 
     def set_bonus_for_count(self, set_name: str, piece_count: int) -> dict[str, float]:
         if piece_count <= 0:
@@ -2048,11 +2101,13 @@ class BuildOptimizer:
         required_selections: dict[str, str],
         objective_metric: OptimizationObjective,
         constraints: list[OptimizationConstraint],
+        max_combat_level: int | None,
     ) -> tuple[Any, ...]:
         return (
             selection_signature(required_selections),
             tuple(sorted({term.metric_key for term in objective_metric.terms})),
             tuple(sorted({constraint.metric_key for constraint in constraints})),
+            None if max_combat_level is None else int(max_combat_level),
         )
 
     def _freeze_current_prepared_space(self, cache_id: tuple[Any, ...]) -> PreparedSearchSpace:
@@ -2113,15 +2168,16 @@ class BuildOptimizer:
         required_selections: dict[str, str],
         objective_metric: str | OptimizationObjective,
         constraints: list[OptimizationConstraint],
+        max_combat_level: int | None = None,
     ) -> PreparedSearchSpace:
         raw_objective = coerce_optimization_objective(objective_metric)
-        cache_id = self._prepared_search_cache_key(required_selections, raw_objective, constraints)
+        cache_id = self._prepared_search_cache_key(required_selections, raw_objective, constraints, max_combat_level)
         prepared_space = self._prepared_space_cache.get(cache_id)
         if prepared_space is None:
             self._objective = raw_objective
             self._constraints = tuple(constraints)
             self._metric_keys_for_candidates = self._build_candidate_metric_keys(raw_objective, constraints)
-            self._build_group_candidates(required_selections)
+            self._build_group_candidates(required_selections, max_combat_level)
             self._build_suffix_bounds()
             prepared_space = self._freeze_current_prepared_space(cache_id)
             self._prepared_space_cache[cache_id] = prepared_space
@@ -2135,13 +2191,14 @@ class BuildOptimizer:
         objective_metric: str | OptimizationObjective,
         constraints: list[OptimizationConstraint],
         top_n: int,
+        max_combat_level: int | None = None,
         stop_event: threading.Event | None = None,
         progress_callback: Callable[[list[BuildOption], int, int, float, str], None] | None = None,
         summary_progress_callback: Callable[[list[SearchSolution], int, int, float, str], None] | None = None,
         prepared_space: PreparedSearchSpace | None = None,
     ) -> list[BuildOption]:
         if prepared_space is None:
-            self._prepare_search(required_selections, objective_metric, constraints)
+            self._prepare_search(required_selections, objective_metric, constraints, max_combat_level)
         else:
             self._activate_prepared_space(prepared_space, objective_metric, constraints)
 
@@ -2222,13 +2279,14 @@ class BuildOptimizer:
         objective_metric: str | OptimizationObjective,
         constraints: list[OptimizationConstraint],
         top_n: int,
+        max_combat_level: int | None = None,
         stop_event: threading.Event | None = None,
         progress_callback: Callable[[list[BuildOption], int, int, float, str], None] | None = None,
         summary_progress_callback: Callable[[list[SearchSolution], int, int, float, str], None] | None = None,
         prepared_space: PreparedSearchSpace | None = None,
     ) -> list[BuildOption]:
         if prepared_space is None:
-            self._prepare_search(required_selections, objective_metric, constraints)
+            self._prepare_search(required_selections, objective_metric, constraints, max_combat_level)
         else:
             self._activate_prepared_space(prepared_space, objective_metric, constraints)
 
@@ -2320,13 +2378,14 @@ class BuildOptimizer:
         objective_metric: str | OptimizationObjective,
         constraints: list[OptimizationConstraint],
         top_n: int,
+        max_combat_level: int | None = None,
         sample_time_budget: float = 0.45,
         sample_state_budget: int = 4000,
         prepared_space: PreparedSearchSpace | None = None,
     ) -> ExactSearchEstimate:
         setup_started = time.perf_counter()
         if prepared_space is None:
-            self._prepare_search(required_selections, objective_metric, constraints)
+            self._prepare_search(required_selections, objective_metric, constraints, max_combat_level)
         else:
             self._activate_prepared_space(prepared_space, objective_metric, constraints)
         setup_elapsed = time.perf_counter() - setup_started
@@ -2750,7 +2809,7 @@ class BuildOptimizer:
             keys.update(METRIC_DEFINITIONS[constraint.metric_key].relevant_keys)
         return frozenset(keys)
 
-    def _build_group_candidates(self, required_selections: dict[str, str]) -> None:
+    def _build_group_candidates(self, required_selections: dict[str, str], max_combat_level: int | None = None) -> None:
         filtered_singletons: dict[str, list[CandidateFact]] = {}
         for slot_label, slot_type in SLOT_CONFIGS:
             if slot_label in {"Ring 1", "Ring 2"}:
@@ -2760,13 +2819,17 @@ class BuildOptimizer:
                 fact = self.engine.item_fact_lookup.get(required_label)
                 if fact is None:
                     raise ValueError(f"Unknown required item for {slot_label}: {required_label}")
+                if max_combat_level is not None and fact.level_requirement > int(max_combat_level):
+                    raise ValueError(
+                        f"{required_label} requires combat level {fact.level_requirement}, above the current filter of {int(max_combat_level)}."
+                    )
                 filtered_singletons[slot_label] = [fact]
             else:
-                facts = list(self.engine.slot_candidate_facts[slot_label])
+                facts = self.engine.slot_candidate_facts_for_level(slot_label, max_combat_level)
                 filtered_singletons[slot_label] = self._filter_single_items(facts, slot_label == "Weapon")
 
         ring_candidates = self._filter_single_items(
-            list(self.engine.slot_candidate_facts["Ring 1"]),
+            self.engine.slot_candidate_facts_for_level("Ring 1", max_combat_level),
             False,
         )
         ring1_required = required_selections.get("Ring 1", "").strip()
@@ -2786,6 +2849,12 @@ class BuildOptimizer:
             if fact1 is None or fact2 is None:
                 missing = ring1_required if fact1 is None else ring2_required
                 raise ValueError(f"Unknown required ring: {missing}")
+            if max_combat_level is not None and (
+                fact1.level_requirement > int(max_combat_level) or fact2.level_requirement > int(max_combat_level)
+            ):
+                raise ValueError(
+                    f"Required rings must be at or below combat level {int(max_combat_level)}."
+                )
             ring_pairs = [self._make_candidate_from_facts("Rings", {"Ring 1": ring1_required, "Ring 2": ring2_required}, (fact1, fact2))]
         elif ring1_required or ring2_required:
             fixed_slot = "Ring 1" if ring1_required else "Ring 2"
@@ -2793,6 +2862,10 @@ class BuildOptimizer:
             fixed_item = self.engine.item_fact_lookup.get(ring1_required or ring2_required)
             if fixed_item is None:
                 raise ValueError(f"Unknown required ring: {ring1_required or ring2_required}")
+            if max_combat_level is not None and fixed_item.level_requirement > int(max_combat_level):
+                raise ValueError(
+                    f"{fixed_item.label} requires combat level {fixed_item.level_requirement}, above the current filter of {int(max_combat_level)}."
+                )
             for ring in ring_candidates:
                 ring_pairs.append(
                     self._make_candidate_from_facts(
@@ -3450,7 +3523,7 @@ class BuildOptimizer:
             skill: int(allocation[index] + totals.get(skill, 0.0))
             for index, skill in enumerate(SKILLS)
         }
-        crit_chance = self.engine._skill_percentage(effective_skills["dex"]) / 100.0
+        crit_chance = self.engine._skill_effect_percentage("dex", effective_skills["dex"]) / 100.0
         best_noncrit = max(
             self.engine._damage_boost_percent(element, attack_type, totals, effective_skills, False)
             for element in ELEMENT_ORDER
@@ -4100,6 +4173,10 @@ class WynnBuildTesterApp(tk.Tk):
 
         self.searchable_inputs: list[SearchableCombobox] = []
         self.slot_vars: dict[str, tk.StringVar] = {}
+        self.slot_boxes: dict[str, SearchableCombobox] = {}
+        self.default_combat_level = max(1, int(engine.max_item_level or DEFAULT_COMBAT_LEVEL_FALLBACK))
+        self._active_combat_level_filter = self.default_combat_level
+        self.combat_level_var = tk.StringVar(value=str(self.default_combat_level))
         self.damage_view_var = tk.StringVar(value="Melee")
         self.search_mode_var = tk.StringVar(value=SEARCH_MODE_LABELS[0])
         self.mcts_workers_var = tk.StringVar(value=str(default_mcts_worker_count(DETECTED_LOGICAL_CPUS)))
@@ -4127,6 +4204,7 @@ class WynnBuildTesterApp(tk.Tk):
         self.search_mode_var.trace_add("write", self._invalidate_exact_estimate)
         self.mcts_workers_var.trace_add("write", self._invalidate_exact_estimate)
         self.top_n_var.trace_add("write", self._invalidate_exact_estimate)
+        self.combat_level_var.trace_add("write", self._on_combat_level_changed)
         self.dark_mode_var.trace_add("write", self._apply_theme)
 
         self.protocol("WM_DELETE_WINDOW", self._handle_close)
@@ -4139,10 +4217,52 @@ class WynnBuildTesterApp(tk.Tk):
     @staticmethod
     def _default_generator_status() -> str:
         return (
-            "Current gear entries are treated as required. Base skills are auto-allocated per build for the selected "
+            "Current gear entries are treated as required, and only items at or below the combat-level filter are considered. "
+            "Base skills are auto-allocated per build for the selected "
             f"objective. Exact is optimal but slower; MCTS uses parallel processes and defaults to "
             f"{default_mcts_worker_count(DETECTED_LOGICAL_CPUS)} worker(s) on this device."
         )
+
+    @staticmethod
+    def _validate_integer_input(proposed: str) -> bool:
+        return proposed == "" or proposed.isdigit()
+
+    def _combat_level_filter(self, strict: bool = False) -> int | None:
+        text = self.combat_level_var.get().strip()
+        if not text:
+            if strict:
+                self.generator_status_var.set("Combat level is required before searching.")
+            return None
+        try:
+            level = int(text)
+        except ValueError:
+            if strict:
+                self.generator_status_var.set("Combat level must be a whole number.")
+            return None
+        if level < 1:
+            if strict:
+                self.generator_status_var.set("Combat level must be at least 1.")
+            return None
+        return level
+
+    def _refresh_slot_level_filters(self) -> None:
+        for slot_label, combo in self.slot_boxes.items():
+            allowed_values = self.engine.slot_options_for_level(slot_label, self._active_combat_level_filter)
+            combo.set_values(allowed_values)
+            current = self.slot_vars[slot_label].get().strip()
+            if current and current not in allowed_values:
+                self.slot_vars[slot_label].set("")
+
+    def _on_combat_level_changed(self, *_args: Any) -> None:
+        level = self._combat_level_filter(strict=False)
+        if level is None:
+            self._invalidate_exact_estimate()
+            self._schedule_refresh()
+            return
+        self._active_combat_level_filter = level
+        self._refresh_slot_level_filters()
+        self._invalidate_exact_estimate()
+        self._schedule_refresh()
 
     def _theme_colors(self) -> dict[str, str]:
         return DARK_THEME if self.dark_mode_var.get() else LIGHT_THEME
@@ -4338,17 +4458,30 @@ class WynnBuildTesterApp(tk.Tk):
         equipment_frame = ttk.LabelFrame(parent, text="Equipment", padding=12)
         equipment_frame.pack(fill=tk.X)
 
-        for row, (slot_label, _slot_type) in enumerate(SLOT_CONFIGS):
+        level_validator = (self.register(self._validate_integer_input), "%P")
+        ttk.Label(equipment_frame, text="Combat Level").grid(row=0, column=0, sticky="w", pady=4, padx=(0, 10))
+        ttk.Spinbox(
+            equipment_frame,
+            from_=1,
+            to=max(MAX_COMBAT_LEVEL_INPUT, self.engine.max_item_level, self.default_combat_level),
+            textvariable=self.combat_level_var,
+            width=8,
+            validate="key",
+            validatecommand=level_validator,
+        ).grid(row=0, column=1, sticky="w", pady=4)
+
+        for row, (slot_label, _slot_type) in enumerate(SLOT_CONFIGS, start=1):
             ttk.Label(equipment_frame, text=slot_label).grid(row=row, column=0, sticky="w", pady=4, padx=(0, 10))
             variable = tk.StringVar()
             combo = self._register_searchable(SearchableCombobox(
                 equipment_frame,
-                values=self.engine.slot_options[slot_label],
+                values=self.engine.slot_options_for_level(slot_label, self._active_combat_level_filter),
                 textvariable=variable,
                 width=42,
             ))
             combo.grid(row=row, column=1, sticky="ew", pady=4)
             self.slot_vars[slot_label] = variable
+            self.slot_boxes[slot_label] = combo
 
         equipment_frame.columnconfigure(1, weight=1)
 
@@ -4525,6 +4658,7 @@ class WynnBuildTesterApp(tk.Tk):
 
     def clear_all(self) -> None:
         self.clear_gear()
+        self.combat_level_var.set(str(self.default_combat_level))
         self.search_mode_var.set(SEARCH_MODE_LABELS[0])
         self.mcts_workers_var.set(str(default_mcts_worker_count(DETECTED_LOGICAL_CPUS)))
         self.top_n_var.set("5")
@@ -4671,9 +4805,12 @@ class WynnBuildTesterApp(tk.Tk):
     def _collect_generator_inputs(
         self,
         validate_mcts_workers: bool = True,
-    ) -> tuple[OptimizationObjective, str, list[OptimizationConstraint], int, dict[str, str], int] | None:
+    ) -> tuple[OptimizationObjective, str, list[OptimizationConstraint], int, dict[str, str], int, int] | None:
         objective = self._collect_objective(strict=True)
         if objective is None:
+            return None
+        combat_level = self._combat_level_filter(strict=True)
+        if combat_level is None:
             return None
         search_mode = SEARCH_MODE_OPTIONS.get(self.search_mode_var.get())
         if search_mode is None:
@@ -4727,11 +4864,13 @@ class WynnBuildTesterApp(tk.Tk):
             if value.strip()
         }
         for slot, value in required_selections.items():
-            if value not in self.engine.slot_options[slot]:
-                self.generator_status_var.set(f"{slot} must be a recognized item before it can be required.")
+            if value not in self.engine.slot_options_for_level(slot, combat_level):
+                self.generator_status_var.set(
+                    f"{slot} must be a recognized item at or below combat level {combat_level} before it can be required."
+                )
                 return None
 
-        return objective, search_mode, constraints, top_n, required_selections, mcts_worker_count
+        return objective, search_mode, constraints, top_n, required_selections, mcts_worker_count, combat_level
 
     def start_exact_estimate(self) -> None:
         if self.optimizer_thread and self.optimizer_thread.is_alive():
@@ -4740,7 +4879,7 @@ class WynnBuildTesterApp(tk.Tk):
         generator_inputs = self._collect_generator_inputs(validate_mcts_workers=False)
         if generator_inputs is None:
             return
-        objective, _search_mode, constraints, top_n, required_selections, _mcts_worker_count = generator_inputs
+        objective, _search_mode, constraints, top_n, required_selections, _mcts_worker_count, combat_level = generator_inputs
 
         while True:
             try:
@@ -4761,6 +4900,7 @@ class WynnBuildTesterApp(tk.Tk):
                     objective,
                     constraints,
                     top_n,
+                    combat_level,
                 )
                 self.optimizer_queue.put(("estimate_result", estimate, objective, len(constraints)))
             except Exception as exc:
@@ -4777,7 +4917,7 @@ class WynnBuildTesterApp(tk.Tk):
         generator_inputs = self._collect_generator_inputs()
         if generator_inputs is None:
             return
-        objective, search_mode, constraints, top_n, required_selections, mcts_worker_count = generator_inputs
+        objective, search_mode, constraints, top_n, required_selections, mcts_worker_count, combat_level = generator_inputs
 
         while True:
             try:
@@ -4810,6 +4950,7 @@ class WynnBuildTesterApp(tk.Tk):
                     required_selections,
                     objective,
                     constraints,
+                    combat_level,
                 )
                 if search_mode == "mcts":
                     options = self.parallel_mcts_pool.run_search(
@@ -4828,6 +4969,7 @@ class WynnBuildTesterApp(tk.Tk):
                         objective,
                         constraints,
                         top_n,
+                        combat_level,
                         stop_event=self.search_stop_event,
                         progress_callback=progress_callback,
                         prepared_space=prepared_space,
@@ -5006,7 +5148,9 @@ class WynnBuildTesterApp(tk.Tk):
         if option is None:
             return
         for slot, variable in self.slot_vars.items():
-            variable.set(option.selections.get(slot, ""))
+            value = option.selections.get(slot, "")
+            allowed_values = self.engine.slot_options_for_level(slot, self._active_combat_level_filter)
+            variable.set(value if not value or value in allowed_values else "")
 
     def _schedule_refresh(self, *_args: Any) -> None:
         if self._refresh_job is not None:
@@ -5039,6 +5183,7 @@ class WynnBuildTesterApp(tk.Tk):
 
         lines.append("")
         lines.append("Build Summary")
+        lines.append(f"  Combat level filter: {self._active_combat_level_filter}")
         lines.append(f"  Level requirement: {result.level_requirement}")
         lines.append(f"  Weapon class: {result.weapon_class or 'None'}")
         lines.append(f"  Gear health bonus: {format_number(result.gear_health_bonus)}")
@@ -5057,7 +5202,7 @@ class WynnBuildTesterApp(tk.Tk):
             base_value = result.base_skills[skill]
             bonus_value = result.totals.get(skill, 0.0)
             total_value = result.effective_skills[skill]
-            percentage = self.engine._skill_percentage(total_value)
+            percentage = self.engine._skill_effect_percentage(skill, total_value)
             lines.append(
                 f"  {SKILL_LABELS[skill]}: {base_value} base + {format_number(bonus_value)} gear = {total_value} total ({format_percent(percentage)})"
             )
@@ -5127,7 +5272,7 @@ class WynnBuildTesterApp(tk.Tk):
         )
         strength_poison = 0.0
         if result.totals.get("poison"):
-            strength_bonus = self.engine._skill_percentage(result.effective_skills["str"]) / 100.0
+            strength_bonus = self.engine._skill_effect_percentage("str", result.effective_skills["str"]) / 100.0
             strength_poison = math.ceil((result.totals.get("poison", 0.0) / 3.0) * (1.0 + strength_bonus))
 
         if profile.attack_type == "spell":
@@ -5203,6 +5348,35 @@ class WynnBuildTesterApp(tk.Tk):
 
 
 def run_self_test(engine: WynnBuildEngine) -> int:
+    if not math.isclose(engine._skill_effect_percentage("def", 150), 70.0, abs_tol=0.1):
+        raise AssertionError("Defence scaling no longer matches the current skill-point curve.")
+    if not math.isclose(engine._skill_effect_percentage("agi", 150), 76.8, abs_tol=0.1):
+        raise AssertionError("Agility scaling no longer matches the current skill-point curve.")
+    if not math.isclose(engine._intelligence_spell_cost_reduction_percentage(150), 50.0, abs_tol=0.05):
+        raise AssertionError("Intelligence spell-cost reduction no longer matches the current skill-point curve.")
+
+    sample_totals = {"hp": 1000.0}
+    sample_skills = {"str": 0, "dex": 0, "int": 0, "def": 150, "agi": 150}
+    expected_multiplier = (
+        (engine._skill_effect_percentage("agi", sample_skills["agi"]) / 100.0) * 0.1
+    ) + (
+        (1.0 - (engine._skill_effect_percentage("agi", sample_skills["agi"]) / 100.0))
+        * (1.0 - (engine._skill_effect_percentage("def", sample_skills["def"]) / 100.0))
+    )
+    expected_ehp = sample_totals["hp"] / expected_multiplier
+    if not math.isclose(engine._effective_hp_value(sample_totals, sample_skills), expected_ehp, rel_tol=1e-9):
+        raise AssertionError("Effective HP is no longer using the wiki dodge-plus-defence interaction.")
+
+    thunder_crit_boost = engine._damage_boost_percent(
+        "t",
+        "melee",
+        {},
+        {"str": 0, "dex": 100, "int": 0, "def": 0, "agi": 0},
+        True,
+    )
+    if not math.isclose(thunder_crit_boost, 230.0, abs_tol=0.1):
+        raise AssertionError("Thunder critical scaling no longer matches the wiki dexterity interaction.")
+
     selections = {}
     for slot_label, _slot_type in SLOT_CONFIGS:
         options = engine.slot_options[slot_label]
