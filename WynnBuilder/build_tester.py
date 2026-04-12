@@ -450,6 +450,7 @@ GROUP_CANDIDATE_CAPS = {
     "Necklace": 70,
     "Rings": 500,
 }
+MCTS_UNCAPPED_STATE_THRESHOLD = 500_000
 SEARCH_MODE_OPTIONS = {
     "Exact (optimal, slower)": "exact",
     "MCTS (anytime, stoppable)": "mcts",
@@ -2094,7 +2095,15 @@ class BuildOptimizer:
         self._reward_scale_hint: float = 1.0
         self._prepared_space_cache: dict[tuple[Any, ...], PreparedSearchSpace] = {}
         self._materialized_option_cache: dict[tuple[Any, ...], BuildOption] = {}
-        self._cached_ring_pair_pool: dict[tuple[str, ...], list[GroupCandidate]] = {}
+        self._base_slot_candidate_cache: dict[tuple[str, int | None], tuple[GroupCandidate, ...]] = {}
+        self._filtered_ring_pair_cache: dict[tuple[Any, ...], tuple[GroupCandidate, ...]] = {}
+        self._requirement_region_contains_cache: dict[
+            tuple[
+                tuple[tuple[int, int, int, int, int], ...],
+                tuple[tuple[int, int, int, int, int], ...],
+            ],
+            bool,
+        ] = {}
 
     def _prepared_search_cache_key(
         self,
@@ -2289,6 +2298,7 @@ class BuildOptimizer:
             self._prepare_search(required_selections, objective_metric, constraints, max_combat_level)
         else:
             self._activate_prepared_space(prepared_space, objective_metric, constraints)
+        self._apply_mcts_candidate_caps()
 
         started = time.perf_counter()
         next_progress = started + 0.6
@@ -2772,28 +2782,29 @@ class BuildOptimizer:
         stop_event: threading.Event | None = None,
     ) -> int:
         sequence = sequence_start
-
-        def search_seed(current: SearchState) -> None:
-            nonlocal sequence
+        seed_attempts = [False, True, True, True, True, True]
+        for randomized in seed_attempts:
             if stop_event and stop_event.is_set():
-                return
+                break
             if len(solutions) >= top_n:
-                return
-            if current.group_index >= len(self._group_order):
-                option = self._build_option_from_state(current)
-                if option:
-                    self._push_solution(solutions, option, top_n, sequence)
-                    sequence += 1
-                return
+                break
+            _reward, option = self._greedy_complete_state(state, randomized=randomized)
+            if option is None:
+                continue
+            self._push_solution(solutions, option, top_n, sequence)
+            sequence += 1
 
-            for candidate in self._group_candidates[current.group_index][:8]:
-                child = self._apply_candidate(current, candidate)
-                if self._constraints_still_possible(child):
-                    search_seed(child)
-                if len(solutions) >= top_n:
-                    return
-
-        search_seed(state)
+        rollout_attempts = max(8, min(24, top_n * 6))
+        for _attempt in range(rollout_attempts):
+            if stop_event and stop_event.is_set():
+                break
+            if len(solutions) >= top_n:
+                break
+            _reward, option = self._rollout_from_state(state)
+            if option is None:
+                continue
+            self._push_solution(solutions, option, top_n, sequence)
+            sequence += 1
         return sequence
 
     def _build_candidate_metric_keys(
@@ -2809,9 +2820,188 @@ class BuildOptimizer:
             keys.update(METRIC_DEFINITIONS[constraint.metric_key].relevant_keys)
         return frozenset(keys)
 
+    def _objective_family(self) -> str:
+        if any(
+            term.metric_key in {"melee_avg", "spell_avg"}
+            for term in self._objective.terms
+        ) or any(
+            constraint.metric_key in {"melee_avg", "spell_avg"}
+            for constraint in self._constraints
+        ):
+            return "damage"
+        return "stat"
+
+    def _raw_total_state_estimate(self) -> int:
+        raw_total_states = 1
+        product = 1
+        for candidates in self._group_candidates:
+            product *= max(1, len(candidates))
+            raw_total_states += product
+        return raw_total_states
+
+    def _apply_mcts_candidate_caps(self) -> None:
+        if not self._group_candidates:
+            return
+        if self._raw_total_state_estimate() <= MCTS_UNCAPPED_STATE_THRESHOLD:
+            return
+
+        capped_groups: list[list[GroupCandidate]] = []
+        changed = False
+        for group_name, candidates in zip(self._group_order, self._group_candidates):
+            cap = GROUP_CANDIDATE_CAPS.get(group_name)
+            if cap is None or len(candidates) <= cap:
+                capped_groups.append(candidates)
+                continue
+            capped_groups.append(sorted(candidates, key=self._candidate_sort_key, reverse=True)[:cap])
+            changed = True
+
+        if not changed:
+            return
+        self._group_candidates = capped_groups
+        self._build_suffix_bounds()
+
+    @staticmethod
+    def _metric_vector_dominates(left: tuple[float, ...], right: tuple[float, ...]) -> bool:
+        strictly_better = False
+        for left_value, right_value in zip(left, right):
+            if left_value < right_value:
+                return False
+            if left_value > right_value:
+                strictly_better = True
+        return strictly_better
+
+    def _base_slot_candidates(
+        self,
+        slot_label: str,
+        max_combat_level: int | None,
+    ) -> list[GroupCandidate]:
+        cache_key = (slot_label, None if max_combat_level is None else int(max_combat_level))
+        cached = self._base_slot_candidate_cache.get(cache_key)
+        if cached is not None:
+            return list(cached)
+
+        base_candidates = tuple(
+            self._make_candidate_from_facts(
+                slot_label,
+                {slot_label: fact.label},
+                (fact,),
+                pack_for_search=False,
+            )
+            for fact in self.engine.slot_candidate_facts_for_level(slot_label, max_combat_level)
+        )
+        self._base_slot_candidate_cache[cache_key] = base_candidates
+        return list(base_candidates)
+
+    def _reduce_same_requirement_candidates(
+        self,
+        candidates: list[GroupCandidate],
+    ) -> list[GroupCandidate]:
+        ordered = sorted(candidates, key=lambda candidate: candidate.sort_vector, reverse=True)
+        kept: list[GroupCandidate] = []
+        seen_vectors: set[tuple[float, ...]] = set()
+        for candidate in ordered:
+            if candidate.metric_vector in seen_vectors:
+                continue
+            dominated = False
+            index = 0
+            while index < len(kept):
+                other = kept[index]
+                if self._metric_vector_dominates(other.metric_vector, candidate.metric_vector):
+                    dominated = True
+                    break
+                if self._metric_vector_dominates(candidate.metric_vector, other.metric_vector):
+                    kept.pop(index)
+                else:
+                    index += 1
+            if not dominated:
+                kept.append(candidate)
+                seen_vectors.add(candidate.metric_vector)
+        return kept
+
+    @staticmethod
+    def _requirement_region_sort_key(
+        req_packed: tuple[tuple[int, int, int, int, int], ...],
+    ) -> tuple[Any, ...]:
+        minima_sums = tuple(sum(values) for values in req_packed)
+        return (
+            min(minima_sums, default=0),
+            len(req_packed),
+            minima_sums,
+            req_packed,
+        )
+
+    def _cached_requirement_region_contains(
+        self,
+        left_minima: tuple[tuple[int, int, int, int, int], ...],
+        right_minima: tuple[tuple[int, int, int, int, int], ...],
+    ) -> bool:
+        cache_key = (left_minima, right_minima)
+        cached = self._requirement_region_contains_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        if len(left_minima) == 1:
+            left = left_minima[0]
+            if len(right_minima) == 1:
+                right = right_minima[0]
+                result = all(left[i] <= right[i] for i in range(5))
+            else:
+                result = True
+                for right in right_minima:
+                    if any(left[i] > right[i] for i in range(5)):
+                        result = False
+                        break
+        else:
+            result = True
+            for right in right_minima:
+                matched = False
+                for left in left_minima:
+                    if all(left[i] <= right[i] for i in range(5)):
+                        matched = True
+                        break
+                if not matched:
+                    result = False
+                    break
+        self._requirement_region_contains_cache[cache_key] = result
+        return result
+
+    def _build_ring_pair_frontier(
+        self,
+        ring_candidates: list[GroupCandidate],
+    ) -> list[GroupCandidate]:
+        ring_labels = tuple(candidate.item_labels[0] for candidate in ring_candidates)
+        cache_key = (
+            ring_labels,
+            tuple(sorted(self._metric_keys_for_candidates)),
+        )
+        cached = self._filtered_ring_pair_cache.get(cache_key)
+        if cached is not None:
+            return list(cached)
+
+        pair_candidates: list[GroupCandidate] = []
+        for index, left_candidate in enumerate(ring_candidates):
+            left_label = left_candidate.item_labels[0]
+            left_fact = self.engine.item_fact_lookup[left_label]
+            for right_candidate in ring_candidates[index:]:
+                right_label = right_candidate.item_labels[0]
+                right_fact = self.engine.item_fact_lookup[right_label]
+                pair_candidates.append(
+                    self._make_candidate_from_facts(
+                        "Rings",
+                        {"Ring 1": left_label, "Ring 2": right_label},
+                        (left_fact, right_fact),
+                        pack_for_search=False,
+                    )
+                )
+
+        filtered = tuple(self._filter_group_candidates(pair_candidates))
+        self._filtered_ring_pair_cache[cache_key] = filtered
+        return list(filtered)
+
     def _build_group_candidates(self, required_selections: dict[str, str], max_combat_level: int | None = None) -> None:
-        filtered_singletons: dict[str, list[CandidateFact]] = {}
-        for slot_label, slot_type in SLOT_CONFIGS:
+        filtered_singletons: dict[str, list[GroupCandidate]] = {}
+        damage_involved = self._objective_family() == "damage"
+
+        for slot_label, _slot_type in SLOT_CONFIGS:
             if slot_label in {"Ring 1", "Ring 2"}:
                 continue
             required_label = required_selections.get(slot_label, "").strip()
@@ -2823,24 +3013,21 @@ class BuildOptimizer:
                     raise ValueError(
                         f"{required_label} requires combat level {fact.level_requirement}, above the current filter of {int(max_combat_level)}."
                     )
-                filtered_singletons[slot_label] = [fact]
+                filtered_singletons[slot_label] = [
+                    self._make_candidate_from_facts(slot_label, {slot_label: fact.label}, (fact,))
+                ]
             else:
-                facts = self.engine.slot_candidate_facts_for_level(slot_label, max_combat_level)
-                filtered_singletons[slot_label] = self._filter_single_items(facts, slot_label == "Weapon")
+                base_candidates = self._base_slot_candidates(slot_label, max_combat_level)
+                filtered_singletons[slot_label] = self._filter_group_candidates(base_candidates)
 
-        ring_candidates = self._filter_single_items(
-            self.engine.slot_candidate_facts_for_level("Ring 1", max_combat_level),
-            False,
-        )
+        ring_candidates = self._filter_group_candidates(self._base_slot_candidates("Ring 1", max_combat_level))
         ring1_required = required_selections.get("Ring 1", "").strip()
         ring2_required = required_selections.get("Ring 2", "").strip()
 
-        group_candidates: dict[str, list[GroupCandidate]] = {}
-        for slot_label in ("Helmet", "Chestplate", "Pants", "Boots", "Bracelet", "Necklace", "Weapon"):
-            group_candidates[slot_label] = [
-                self._make_candidate_from_facts(slot_label, {slot_label: fact.label}, (fact,))
-                for fact in filtered_singletons[slot_label]
-            ]
+        group_candidates: dict[str, list[GroupCandidate]] = {
+            slot_label: list(filtered_singletons[slot_label])
+            for slot_label in ("Helmet", "Chestplate", "Pants", "Boots", "Bracelet", "Necklace", "Weapon")
+        }
 
         ring_pairs: list[GroupCandidate] = []
         if ring1_required and ring2_required:
@@ -2867,33 +3054,19 @@ class BuildOptimizer:
                     f"{fixed_item.label} requires combat level {fixed_item.level_requirement}, above the current filter of {int(max_combat_level)}."
                 )
             for ring in ring_candidates:
+                ring_label = ring.item_labels[0]
+                ring_fact = self.engine.item_fact_lookup[ring_label]
                 ring_pairs.append(
                     self._make_candidate_from_facts(
                         "Rings",
-                        {fixed_slot: fixed_item.label, open_slot: ring.label},
-                        (fixed_item, ring),
+                        {fixed_slot: fixed_item.label, open_slot: ring_label},
+                        (fixed_item, ring_fact),
                     )
                 )
         else:
-            ring_pool_key = tuple(fact.label for fact in ring_candidates)
-            ring_pairs = self._cached_ring_pair_pool.get(ring_pool_key, [])
-            if not ring_pairs:
-                ring_pairs = []
-                for left, right in itertools.combinations_with_replacement(ring_candidates, 2):
-                    ring_pairs.append(
-                        self._make_candidate_from_facts(
-                            "Rings",
-                            {"Ring 1": left.label, "Ring 2": right.label},
-                            (left, right),
-                            pack_for_search=False,
-                        )
-                    )
-                self._cached_ring_pair_pool[ring_pool_key] = ring_pairs
-        group_candidates["Rings"] = self._filter_group_candidates(ring_pairs)
+            ring_pairs = self._build_ring_pair_frontier(ring_candidates)
+        group_candidates["Rings"] = self._filter_group_candidates(ring_pairs) if ring1_required or ring2_required else ring_pairs
 
-        damage_involved = any(
-            metric.metric_key in {"melee_avg", "spell_avg"} for metric in self._constraints
-        ) or any(term.metric_key in {"melee_avg", "spell_avg"} for term in self._objective.terms)
         ordered_names = ["Weapon"] if damage_involved else []
         for slot_label in ("Helmet", "Chestplate", "Pants", "Boots", "Rings", "Bracelet", "Necklace", "Weapon"):
             if slot_label not in ordered_names:
@@ -2902,18 +3075,9 @@ class BuildOptimizer:
 
         self._group_order = ordered_names
         self._group_candidates = [
-            sorted(group_candidates[name], key=self._candidate_sort_key, reverse=True)[: GROUP_CANDIDATE_CAPS.get(name, len(group_candidates[name]))]
+            sorted(group_candidates[name], key=self._candidate_sort_key, reverse=True)
             for name in self._group_order
         ]
-
-    def _filter_single_items(self, items: list[CandidateFact], is_weapon_group: bool) -> list[CandidateFact]:
-        candidates = [
-            self._make_candidate_from_facts("Weapon" if is_weapon_group else "Item", {"__label__": item.label}, (item,))
-            for item in items
-        ]
-        filtered = self._filter_group_candidates(candidates, keep_placeholder_slot=True)
-        labels = [candidate.selections["__label__"] for candidate in filtered]
-        return [self.engine.item_fact_lookup[label] for label in labels]
 
     def _make_candidate_from_facts(
         self,
@@ -2956,10 +3120,10 @@ class BuildOptimizer:
         req_packed = tuple(sorted(candidate.req_minima))
         return GroupCandidate(
             group_name=candidate.group_name,
-            selections=dict(candidate.selections),
+            selections=candidate.selections,
             item_labels=candidate.item_labels,
-            totals=dict(candidate.totals),
-            set_counts=dict(candidate.set_counts),
+            totals=candidate.totals,
+            set_counts=candidate.set_counts,
             req_minima=candidate.req_minima,
             weapon_label=candidate.weapon_label,
             metric_vector=metric_vector,
@@ -2985,55 +3149,85 @@ class BuildOptimizer:
 
         survivors: list[GroupCandidate] = []
         for bucket_candidates in buckets.values():
-            kept: list[GroupCandidate] = []
             packed_candidates = [self._pack_candidate_for_search(candidate) for candidate in bucket_candidates]
-            packed_candidates.sort(key=lambda candidate: candidate.sort_vector, reverse=True)
+            by_requirements: defaultdict[tuple[tuple[int, int, int, int, int], ...], list[GroupCandidate]] = defaultdict(list)
             for candidate in packed_candidates:
-                dominated = False
-                index = 0
-                while index < len(kept):
-                    other = kept[index]
-                    if self._candidate_dominates(other, candidate):
-                        dominated = True
-                        break
-                    if self._candidate_dominates(candidate, other):
-                        kept.pop(index)
-                    else:
-                        index += 1
-                if not dominated:
-                    kept.append(candidate)
-            survivors.extend(kept)
+                by_requirements[candidate.req_packed].append(candidate)
+
+            reduced_by_requirements = {
+                req_packed: self._reduce_same_requirement_candidates(group_candidates)
+                for req_packed, group_candidates in by_requirements.items()
+            }
+            simple_requirements: dict[tuple[int, int, int, int, int], list[GroupCandidate]] = {}
+            complex_requirements: dict[tuple[tuple[int, int, int, int, int], ...], list[GroupCandidate]] = {}
+            for req_packed, reduced_candidates in reduced_by_requirements.items():
+                if len(req_packed) == 1:
+                    simple_requirements[req_packed[0]] = reduced_candidates
+                else:
+                    complex_requirements[req_packed] = reduced_candidates
+
+            accepted_simple: list[tuple[tuple[int, int, int, int, int], GroupCandidate]] = []
+            for req_tuple in sorted(
+                simple_requirements,
+                key=lambda values: (sum(values), values),
+            ):
+                accepted: list[GroupCandidate] = []
+                for candidate in simple_requirements[req_tuple]:
+                    dominated = False
+                    for other_req, other in accepted_simple:
+                        if any(other_req[index] > req_tuple[index] for index in range(5)):
+                            continue
+                        if self._metric_vector_dominates(other.metric_vector, candidate.metric_vector):
+                            dominated = True
+                            break
+                    if not dominated:
+                        accepted.append(candidate)
+                if accepted:
+                    survivors.extend(accepted)
+                    accepted_simple.extend((req_tuple, candidate) for candidate in accepted)
+
+            accepted_complex: list[tuple[tuple[tuple[int, int, int, int, int], ...], GroupCandidate]] = []
+            for req_packed in sorted(complex_requirements, key=self._requirement_region_sort_key):
+                accepted: list[GroupCandidate] = []
+                for candidate in complex_requirements[req_packed]:
+                    dominated = False
+                    for other_req, other in accepted_simple:
+                        if self._cached_requirement_region_contains((other_req,), req_packed) and self._metric_vector_dominates(
+                            other.metric_vector,
+                            candidate.metric_vector,
+                        ):
+                            dominated = True
+                            break
+                    if dominated:
+                        continue
+                    for other_req, other in accepted_complex:
+                        if self._cached_requirement_region_contains(other_req, req_packed) and self._metric_vector_dominates(
+                            other.metric_vector,
+                            candidate.metric_vector,
+                        ):
+                            dominated = True
+                            break
+                    if not dominated:
+                        accepted.append(candidate)
+                if accepted:
+                    survivors.extend(accepted)
+                    accepted_complex.extend((req_packed, candidate) for candidate in accepted)
 
         if keep_placeholder_slot:
             return survivors
         return [candidate for candidate in survivors if candidate.selections]
 
     def _candidate_dominates(self, left: GroupCandidate, right: GroupCandidate) -> bool:
-        if not self._requirement_region_contains(left.req_packed or tuple(sorted(left.req_minima)), right.req_packed or tuple(sorted(right.req_minima))):
+        left_req = left.req_packed or tuple(sorted(left.req_minima))
+        right_req = right.req_packed or tuple(sorted(right.req_minima))
+        if not self._cached_requirement_region_contains(left_req, right_req):
             return False
-
-        strictly_better = False
         left_vector = left.metric_vector or tuple(left.totals.get(key, 0.0) for key in sorted(self._metric_keys_for_candidates))
         right_vector = right.metric_vector or tuple(right.totals.get(key, 0.0) for key in sorted(self._metric_keys_for_candidates))
-        for index, left_value in enumerate(left_vector):
-            right_value = right_vector[index]
-            if left_value < right_value:
-                return False
-            if left_value > right_value:
-                strictly_better = True
-
-        if not strictly_better and (left.req_packed or tuple(sorted(left.req_minima))) == (right.req_packed or tuple(sorted(right.req_minima))):
+        if not self._metric_vector_dominates(left_vector, right_vector):
             return False
-        return True
-
-    @staticmethod
-    def _requirement_region_contains(
-        left_minima: tuple[tuple[int, int, int, int, int], ...],
-        right_minima: tuple[tuple[int, int, int, int, int], ...],
-    ) -> bool:
-        for right in right_minima:
-            if not any(all(left[i] <= right[i] for i in range(5)) for left in left_minima):
-                return False
+        if left_req == right_req:
+            return False
         return True
 
     def _state_bucket(self, state: SearchState) -> tuple[Any, ...]:
@@ -3044,7 +3238,7 @@ class BuildOptimizer:
         )
 
     def _state_dominates(self, left: SearchState, right: SearchState) -> bool:
-        if not self._requirement_region_contains(left.req_minima, right.req_minima):
+        if not self._cached_requirement_region_contains(left.req_minima, right.req_minima):
             return False
         strictly_better = False
         for key in self._metric_keys_for_candidates:
@@ -3298,7 +3492,7 @@ class BuildOptimizer:
         if metric == "hp_total":
             return candidate.totals.get("hp", 0.0) + candidate.totals.get("hpBonus", 0.0)
         if metric == "effective_hp":
-            return self._effective_hp_upper_bound(candidate.totals)
+            return self._effective_hp_upper_bound(candidate.totals, candidate.req_minima)
         if metric == "melee_avg":
             return candidate.totals.get(PSEUDO_MELEE_BASE, 0.0) + candidate.totals.get("mdPct", 0.0) + candidate.totals.get("damPct", 0.0)
         if metric == "spell_avg":
