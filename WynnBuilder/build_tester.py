@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import heapq
 import itertools
 import json
@@ -27,8 +28,11 @@ APP_TITLE = "Wynn Build Tester"
 WINDOW_SIZE = "1440x900"
 DETECTED_LOGICAL_CPUS = max(1, int(os.cpu_count() or 1))
 DEFAULT_MCTS_WORKERS = max(1, DETECTED_LOGICAL_CPUS // 2)
-DEFAULT_COMBAT_LEVEL_FALLBACK = 105
-MAX_COMBAT_LEVEL_INPUT = 200
+DEFAULT_BUILD_LEVEL_FALLBACK = 105
+DEFAULT_COMBAT_LEVEL_FALLBACK = DEFAULT_BUILD_LEVEL_FALLBACK
+MAX_BUILD_LEVEL = 121
+MAX_COMBAT_LEVEL_INPUT = MAX_BUILD_LEVEL
+MAX_BASE_SKILL_POINTS = 100
 
 LIGHT_THEME = {
     "bg": "#f3f5f8",
@@ -93,15 +97,29 @@ WEAPON_CLASS_NAMES = {
     "spear": "Warrior",
     "wand": "Mage",
 }
+ATTACK_SPEED_ORDER = (
+    "SUPER_SLOW",
+    "VERY_SLOW",
+    "SLOW",
+    "NORMAL",
+    "FAST",
+    "VERY_FAST",
+    "SUPER_FAST",
+)
+BASE_DAMAGE_MULTIPLIERS = (0.51, 0.83, 1.50, 2.05, 2.50, 3.10, 4.30)
 ATTACK_SPEED_MULTIPLIERS = {
-    "SUPER_FAST": 4.30,
-    "VERY_FAST": 3.10,
-    "FAST": 2.50,
-    "NORMAL": 2.05,
-    "SLOW": 1.50,
-    "VERY_SLOW": 0.83,
-    "SUPER_SLOW": 0.51,
+    speed: BASE_DAMAGE_MULTIPLIERS[index]
+    for index, speed in enumerate(ATTACK_SPEED_ORDER)
 }
+CLASS_DEFENSE_MULTIPLIERS = {
+    "relik": 0.60,
+    "bow": 0.70,
+    "wand": 0.80,
+    "dagger": 1.00,
+    "spear": 1.00,
+}
+DEFAULT_CLASS_DEFENSE = 1.00
+DEFAULT_AGILITY_DEFENSE = 90.0
 SLOT_CONFIGS = (
     ("Helmet", "helmet"),
     ("Chestplate", "chestplate"),
@@ -348,16 +366,61 @@ STAT_LABELS = {
 }
 PSEUDO_MELEE_BASE = "__meleeBaseAvg"
 PSEUDO_SPELL_BASE = "__spellBaseAvg"
+DERIVED_STAT_LABELS = {
+    "hp_total": "Total HP",
+    "effective_hp": "Effective HP",
+    "effective_hp_no_agi": "Effective HP (No Agility)",
+    "hpr_total": "HP Regen Total",
+    "effective_hpr": "Effective HP Regen",
+    "effective_hpr_no_agi": "Effective HP Regen (No Agility)",
+    "mr_total": "Mana Regen Total",
+    "effective_ls": "Effective Life Steal",
+    "life_per_hit": "Life Per Hit",
+    "mana_per_hit": "Mana Per Hit",
+    "e_def_total": "Earth Defense Total",
+    "t_def_total": "Thunder Defense Total",
+    "w_def_total": "Water Defense Total",
+    "f_def_total": "Fire Defense Total",
+    "a_def_total": "Air Defense Total",
+}
+EXCLUDED_RAW_STAT_METRIC_KEYS = {
+    "hp",
+    "hpBonus",
+    "aDef",
+    "eDef",
+    "tDef",
+    "wDef",
+    "fDef",
+    "mr",
+    "ls",
+    "ms",
+}
 DIRECT_METRIC_ALIASES = {
     "hp_total": "hp_total",
     "hp": "hp_total",
     "ehp": "effective_hp",
     "effective hp": "effective_hp",
     "effective_hp": "effective_hp",
-    "hpr": "hprRaw",
-    "health regen": "hprRaw",
-    "mr": "mr",
-    "ms": "ms",
+    "ehp no agi": "effective_hp_no_agi",
+    "effective hp no agi": "effective_hp_no_agi",
+    "hpr": "hpr_total",
+    "health regen": "hpr_total",
+    "hp regen": "hpr_total",
+    "ehpr": "effective_hpr",
+    "effective hp regen": "effective_hpr",
+    "mr": "mr_total",
+    "mana regen": "mr_total",
+    "ms": "mana_per_hit",
+    "mana steal": "mana_per_hit",
+    "mana per hit": "mana_per_hit",
+    "ls": "effective_ls",
+    "life steal": "effective_ls",
+    "life per hit": "life_per_hit",
+    "earth defense": "e_def_total",
+    "thunder defense": "t_def_total",
+    "water defense": "w_def_total",
+    "fire defense": "f_def_total",
+    "air defense": "a_def_total",
     "ws": "spd",
     "walk_speed": "spd",
     "walk speed": "spd",
@@ -457,8 +520,6 @@ SEARCH_MODE_OPTIONS = {
 }
 SEARCH_MODE_LABELS = tuple(SEARCH_MODE_OPTIONS)
 CONSTRAINT_OPERATORS = (">", "<", "=")
-LEVEL_105_TOTAL_SKILL_POINTS = 200
-LEVEL_105_MAX_BASE_SKILL = 100
 MANA_ALLOCATION_METRICS = {
     "mr",
     "ms",
@@ -590,6 +651,21 @@ SPELLS_BY_WEAPON: dict[str, tuple[SpellDefinition, ...]] = {
     ),
 }
 
+SPELL_COST_NAMES_BY_WEAPON: dict[str, tuple[str, str, str, str]] = {
+    "bow": ("Arrow Storm", "Escape", "Arrow Bomb", "Arrow Shield"),
+    "spear": ("Bash", "Charge", "Uppercut", "War Scream"),
+    "wand": ("Heal", "Teleport", "Meteor", "Ice Snake"),
+    "dagger": ("Spin Attack", "Dash", "Multihit", "Smoke Bomb"),
+    "relik": ("Totem", "Haul", "Aura", "Uproot"),
+}
+SPELL_BASE_COSTS_BY_WEAPON: dict[str, tuple[float, float, float, float]] = {
+    "bow": (35.0, 20.0, 45.0, 30.0),
+    "spear": (40.0, 25.0, 40.0, 30.0),
+    "wand": (35.0, 25.0, 50.0, 30.0),
+    "dagger": (40.0, 20.0, 40.0, 35.0),
+    "relik": (30.0, 15.0, 40.0, 30.0),
+}
+
 
 @dataclass
 class DamageRange:
@@ -597,13 +673,32 @@ class DamageRange:
     maximum: float = 0.0
 
     @classmethod
-    def from_string(cls, raw_value: str | None) -> "DamageRange":
-        if not raw_value:
+    def from_string(cls, raw_value: Any) -> "DamageRange":
+        if raw_value is None or raw_value == "":
             return cls()
+        if isinstance(raw_value, str):
+            trimmed = raw_value.strip()
+            if trimmed.startswith("{") or trimmed.startswith("["):
+                try:
+                    return cls.from_string(ast.literal_eval(trimmed))
+                except (SyntaxError, ValueError):
+                    return cls()
+        if isinstance(raw_value, dict):
+            try:
+                minimum = float(raw_value.get("min", 0.0) or 0.0)
+                maximum = float(raw_value.get("max", raw_value.get("raw", minimum)) or minimum)
+                return cls(minimum, maximum)
+            except (TypeError, ValueError):
+                return cls()
+        if isinstance(raw_value, (list, tuple)) and len(raw_value) >= 2:
+            try:
+                return cls(float(raw_value[0]), float(raw_value[1]))
+            except (TypeError, ValueError):
+                return cls()
         try:
             left, right = raw_value.split("-", 1)
             return cls(float(left), float(right))
-        except ValueError:
+        except (AttributeError, TypeError, ValueError):
             return cls()
 
     def clone(self) -> "DamageRange":
@@ -637,6 +732,7 @@ class DamageProfile:
 
 @dataclass
 class BuildResult:
+    build_level: int
     selected_items: dict[str, dict[str, Any]]
     base_skills: dict[str, int]
     base_skill_total: int
@@ -654,6 +750,7 @@ class BuildResult:
     gear_health_bonus: float
     weapon_class: str | None
     weapon: dict[str, Any] | None
+    derived_stats: dict[str, float]
     damage_profiles: dict[str, DamageProfile]
 
 
@@ -722,9 +819,123 @@ def combine_dicts(*parts: dict[str, float]) -> dict[str, float]:
 
 
 def normalize_stat_key(key: str) -> str:
+    if key in DERIVED_STAT_LABELS:
+        return DERIVED_STAT_LABELS[key]
     if key in STAT_LABELS:
         return STAT_LABELS[key]
     return key
+
+
+def clamp_build_level(level: int | float | None) -> int:
+    try:
+        numeric_level = int(level or DEFAULT_BUILD_LEVEL_FALLBACK)
+    except (TypeError, ValueError):
+        numeric_level = DEFAULT_BUILD_LEVEL_FALLBACK
+    return max(1, min(MAX_BUILD_LEVEL, numeric_level))
+
+
+def skill_points_to_percentage(points: int) -> float:
+    safe_points = max(0, min(150, int(points)))
+    ratio = 0.9908
+    return (ratio / (1.0 - ratio) * (1.0 - math.pow(ratio, safe_points))) / 100.0
+
+
+SKILLPOINT_FINAL_MULTIPLIERS = {
+    "str": 1.0,
+    "dex": 1.0,
+    "int": 0.5 / skill_points_to_percentage(150),
+    "def": 0.867,
+    "agi": 0.951,
+}
+SKILLPOINT_DAMAGE_MULTIPLIERS = {
+    "str": 1.0,
+    "dex": 1.0,
+    "int": 1.0,
+    "def": 0.867,
+    "agi": 0.951,
+}
+
+
+def level_to_skill_points(level: int) -> int:
+    if level < 1:
+        return 0
+    if level >= 101:
+        return 200
+    return (int(level) - 1) * 2
+
+
+def level_to_hp_base(level: int) -> int:
+    safe_level = clamp_build_level(level)
+    return (5 * safe_level) + 5
+
+
+def raw_to_pct(raw: float, pct: float) -> float:
+    if raw < 0.0:
+        return min(0.0, raw - (raw * pct))
+    if raw > 0.0:
+        return raw + (raw * pct)
+    return 0.0
+
+
+def raw_to_pct_uncapped(raw: float, pct: float) -> float:
+    if raw < 0.0:
+        return raw - (raw * pct)
+    if raw > 0.0:
+        return raw + (raw * pct)
+    return 0.0
+
+
+def base_skill_allocation_feasible(values: tuple[int, int, int, int, int], build_level: int) -> bool:
+    return all(0 <= value <= MAX_BASE_SKILL_POINTS for value in values) and sum(values) <= level_to_skill_points(build_level)
+
+
+def base_skill_allocation_shortfall(values: tuple[int, int, int, int, int], build_level: int) -> int:
+    over_cap = sum(max(0, value - MAX_BASE_SKILL_POINTS) for value in values)
+    over_total = max(0, sum(values) - level_to_skill_points(build_level))
+    return over_cap + over_total
+
+
+def adjusted_attack_speed_index(weapon: dict[str, Any] | None, totals: dict[str, float]) -> int | None:
+    if weapon is None:
+        return None
+    normalized_attack_speed = normalize_attack_speed_code(weapon.get("atkSpd", ""))
+    base_index: int | None = None
+    for index, attack_speed in enumerate(ATTACK_SPEED_ORDER):
+        if normalize_attack_speed_code(attack_speed) == normalized_attack_speed:
+            base_index = index
+            break
+    if base_index is None:
+        return None
+    adjusted = base_index + int(totals.get("atkTier", 0.0))
+    return max(0, min(len(ATTACK_SPEED_ORDER) - 1, adjusted))
+
+
+def attack_speed_multiplier_from_index(index: int | None) -> float | None:
+    if index is None or not (0 <= index < len(BASE_DAMAGE_MULTIPLIERS)):
+        return None
+    return BASE_DAMAGE_MULTIPLIERS[index]
+
+
+def normalize_attack_speed_code(raw_value: Any) -> str:
+    return str(raw_value or "").strip().upper().replace("_", "").replace("-", "").replace(" ", "")
+
+
+def display_attack_speed_label(raw_value: Any) -> str:
+    normalized = normalize_attack_speed_code(raw_value)
+    for attack_speed in ATTACK_SPEED_ORDER:
+        if normalize_attack_speed_code(attack_speed) == normalized:
+            return attack_speed.replace("_", " ").title()
+    return str(raw_value or "UNKNOWN").replace("_", " ").title()
+
+
+def spell_cost_labels_for_weapon(weapon: dict[str, Any] | None) -> tuple[str, str, str, str]:
+    if weapon is None:
+        return ("Spell 1", "Spell 2", "Spell 3", "Spell 4")
+    weapon_type = str(weapon.get("type", "") or "").lower()
+    return SPELL_COST_NAMES_BY_WEAPON.get(
+        weapon_type,
+        ("Spell 1", "Spell 2", "Spell 3", "Spell 4"),
+    )
 
 
 def default_mcts_worker_count(logical_cpus: int | None = None) -> int:
@@ -741,16 +952,6 @@ def skill_tuple_to_dict(values: tuple[int, int, int, int, int]) -> dict[str, int
 
 def skill_dict_to_tuple(values: dict[str, int]) -> tuple[int, int, int, int, int]:
     return tuple(int(values.get(skill, 0)) for skill in SKILLS)
-
-
-def level_105_allocation_feasible(values: tuple[int, int, int, int, int]) -> bool:
-    return all(0 <= value <= LEVEL_105_MAX_BASE_SKILL for value in values) and sum(values) <= LEVEL_105_TOTAL_SKILL_POINTS
-
-
-def level_105_allocation_shortfall(values: tuple[int, int, int, int, int]) -> int:
-    over_cap = sum(max(0, value - LEVEL_105_MAX_BASE_SKILL) for value in values)
-    over_total = max(0, sum(values) - LEVEL_105_TOTAL_SKILL_POINTS)
-    return over_cap + over_total
 
 
 def allocation_strategy_for_metric(metric_key: str) -> str:
@@ -949,6 +1150,7 @@ class SearchSolution:
 @dataclass(frozen=True)
 class PreparedSearchSpace:
     cache_id: tuple[Any, ...]
+    build_level: int
     metric_keys_for_candidates: frozenset[str]
     group_order: tuple[str, ...]
     group_candidates: tuple[tuple[GroupCandidate, ...], ...]
@@ -978,12 +1180,32 @@ class MCTSNode:
 
 def build_metric_definitions() -> dict[str, MetricDefinition]:
     definitions: dict[str, MetricDefinition] = {
-        "hp_total": MetricDefinition("hp_total", "HP", "computed", frozenset({"hp", "hpBonus"})),
-        "effective_hp": MetricDefinition("effective_hp", "Effective HP", "computed", frozenset({"hp", "hpBonus", "def", "agi"})),
+        "hp_total": MetricDefinition("hp_total", DERIVED_STAT_LABELS["hp_total"], "computed", frozenset({"hp", "hpBonus"})),
+        "effective_hp": MetricDefinition("effective_hp", DERIVED_STAT_LABELS["effective_hp"], "computed", frozenset({"hp", "hpBonus", "def", "agi"})),
+        "effective_hp_no_agi": MetricDefinition("effective_hp_no_agi", DERIVED_STAT_LABELS["effective_hp_no_agi"], "computed", frozenset({"hp", "hpBonus", "def"})),
+        "hpr_total": MetricDefinition("hpr_total", DERIVED_STAT_LABELS["hpr_total"], "computed", frozenset({"hprRaw", "hprPct"})),
+        "effective_hpr": MetricDefinition("effective_hpr", DERIVED_STAT_LABELS["effective_hpr"], "computed", frozenset({"hprRaw", "hprPct", "def", "agi"})),
+        "effective_hpr_no_agi": MetricDefinition("effective_hpr_no_agi", DERIVED_STAT_LABELS["effective_hpr_no_agi"], "computed", frozenset({"hprRaw", "hprPct", "def"})),
+        "mr_total": MetricDefinition("mr_total", DERIVED_STAT_LABELS["mr_total"], "computed", frozenset({"mr"})),
+        "effective_ls": MetricDefinition("effective_ls", DERIVED_STAT_LABELS["effective_ls"], "computed", frozenset({"ls", "hp", "hpBonus", "def", "agi", "atkTier"})),
+        "life_per_hit": MetricDefinition("life_per_hit", DERIVED_STAT_LABELS["life_per_hit"], "computed", frozenset({"ls", "atkTier"})),
+        "mana_per_hit": MetricDefinition("mana_per_hit", DERIVED_STAT_LABELS["mana_per_hit"], "computed", frozenset({"ms", "atkTier"})),
+        "e_def_total": MetricDefinition("e_def_total", DERIVED_STAT_LABELS["e_def_total"], "computed", frozenset({"eDef", "eDefPct", "rDefPct"})),
+        "t_def_total": MetricDefinition("t_def_total", DERIVED_STAT_LABELS["t_def_total"], "computed", frozenset({"tDef", "tDefPct", "rDefPct"})),
+        "w_def_total": MetricDefinition("w_def_total", DERIVED_STAT_LABELS["w_def_total"], "computed", frozenset({"wDef", "wDefPct", "rDefPct"})),
+        "f_def_total": MetricDefinition("f_def_total", DERIVED_STAT_LABELS["f_def_total"], "computed", frozenset({"fDef", "fDefPct", "rDefPct"})),
+        "a_def_total": MetricDefinition("a_def_total", DERIVED_STAT_LABELS["a_def_total"], "computed", frozenset({"aDef", "aDefPct", "rDefPct"})),
+        "str": MetricDefinition("str", "Strength Total", "computed", frozenset({"str"})),
+        "dex": MetricDefinition("dex", "Dexterity Total", "computed", frozenset({"dex"})),
+        "int": MetricDefinition("int", "Intelligence Total", "computed", frozenset({"int"})),
+        "def": MetricDefinition("def", "Defense Total", "computed", frozenset({"def"})),
+        "agi": MetricDefinition("agi", "Agility Total", "computed", frozenset({"agi"})),
         "melee_avg": MetricDefinition("melee_avg", "Melee Avg Damage", "computed", frozenset(MELEE_RELEVANT_KEYS)),
         "spell_avg": MetricDefinition("spell_avg", "Spell Avg Damage", "computed", frozenset(SPELL_RELEVANT_KEYS)),
     }
     for key, label in STAT_LABELS.items():
+        if key in definitions or key in EXCLUDED_RAW_STAT_METRIC_KEYS:
+            continue
         definitions[key] = MetricDefinition(key, label, "stat", frozenset({key}))
     return definitions
 
@@ -1179,7 +1401,9 @@ class WynnBuildEngine:
         selections: dict[str, str],
         preferred_metric: str | OptimizationObjective = "hp_total",
         constraints: tuple[OptimizationConstraint, ...] | None = None,
+        build_level: int | None = None,
     ) -> BuildResult:
+        resolved_build_level = clamp_build_level(build_level)
         warnings: list[str] = []
         selected_items: dict[str, dict[str, Any]] = {}
 
@@ -1203,25 +1427,31 @@ class WynnBuildEngine:
         chosen_base_skills = {skill: 0 for skill in SKILLS}
         chosen_objective = coerce_optimization_objective(preferred_metric)
         chosen_metric = chosen_objective.primary_metric_key() if chosen_objective.is_single_metric() else None
+        available_skill_points = level_to_skill_points(resolved_build_level)
 
         if selected_items:
-            optimized_base_skills = self._optimize_level_105_base_skills(
+            if any(int(item.get("lvl", 0) or 0) > resolved_build_level for item in selected_items.values()):
+                warnings.append(
+                    f"One or more selected items require a higher level than the current build level of {resolved_build_level}."
+                )
+            optimized_base_skills = self._optimize_base_skills(
                 selected_items,
                 totals,
                 chosen_objective,
                 tuple(constraints or ()),
+                resolved_build_level,
             )
             if optimized_base_skills is None:
                 equip_order = None
                 warnings.append(
-                    f"This selection cannot be legally and stably equipped by a level 105 build with {LEVEL_105_TOTAL_SKILL_POINTS} total base points and {LEVEL_105_MAX_BASE_SKILL} max in any stat."
+                    f"This selection cannot be legally and stably equipped by a level {resolved_build_level} build with {available_skill_points} total base points and {MAX_BASE_SKILL_POINTS} max in any stat."
                 )
             else:
                 chosen_base_skills = optimized_base_skills
                 equip_order = self._find_equip_order(selected_items, chosen_base_skills)
                 if equip_order is None:
                     warnings.append(
-                        "This selection cannot stay legally equipped with a stable order under the level 105 skill-point budget."
+                        f"This selection cannot stay legally equipped with a stable order under the level {resolved_build_level} skill-point budget."
                     )
         else:
             chosen_base_skills = {skill: 0 for skill in SKILLS}
@@ -1233,12 +1463,14 @@ class WynnBuildEngine:
 
         weapon = selected_items.get("Weapon")
         weapon_class = None
+        derived_stats = self._build_derived_stats(totals, effective_skills, weapon, resolved_build_level)
         damage_profiles: dict[str, DamageProfile] = {}
         if weapon:
             weapon_class = weapon.get("classReq") or WEAPON_CLASS_NAMES.get(str(weapon.get("type")))
             damage_profiles = self._compute_damage_profiles(weapon, totals, effective_skills)
 
         return BuildResult(
+            build_level=resolved_build_level,
             selected_items=selected_items,
             base_skills=chosen_base_skills,
             base_skill_total=sum(chosen_base_skills.values()),
@@ -1256,6 +1488,7 @@ class WynnBuildEngine:
             gear_health_bonus=gear_health_bonus,
             weapon_class=weapon_class,
             weapon=weapon,
+            derived_stats=derived_stats,
             damage_profiles=damage_profiles,
         )
 
@@ -1292,12 +1525,13 @@ class WynnBuildEngine:
 
         return dict(total_bonus), active
 
-    def _optimize_level_105_base_skills(
+    def _optimize_base_skills(
         self,
         selected_items: dict[str, dict[str, Any]],
         totals: dict[str, float],
         preferred_metric: str | OptimizationObjective,
         constraints: tuple[OptimizationConstraint, ...],
+        build_level: int,
     ) -> dict[str, int] | None:
         objective = coerce_optimization_objective(preferred_metric)
         item_labels = tuple(
@@ -1306,24 +1540,27 @@ class WynnBuildEngine:
             if slot in selected_items
         )
         minima_options = self.requirement_minima_for_labels(item_labels)
-        return self._optimize_level_105_base_skills_from_minima(
+        return self._optimize_base_skills_from_minima(
             minima_options,
             totals,
             selected_items.get("Weapon"),
             objective,
             constraints,
+            build_level,
         )
 
-    def _optimize_level_105_base_skills_from_minima(
+    def _optimize_base_skills_from_minima(
         self,
         minima_options: tuple[tuple[int, int, int, int, int], ...],
         totals: dict[str, float],
         weapon: dict[str, Any] | None,
         preferred_metric: str | OptimizationObjective,
         constraints: tuple[OptimizationConstraint, ...],
+        build_level: int,
     ) -> dict[str, int] | None:
         objective = coerce_optimization_objective(preferred_metric)
-        feasible = [option for option in minima_options if level_105_allocation_feasible(option)]
+        resolved_build_level = clamp_build_level(build_level)
+        feasible = [option for option in minima_options if base_skill_allocation_feasible(option, resolved_build_level)]
         if not feasible:
             return None
 
@@ -1331,9 +1568,9 @@ class WynnBuildEngine:
         best_utility: tuple[float, ...] | None = None
 
         for minima in feasible:
-            expanded = self._greedy_expand_allocation(minima, totals, weapon, objective, constraints)
-            refined = self._refine_allocation(minima, expanded, totals, weapon, objective, constraints)
-            utility = self._allocation_utility(refined, totals, weapon, objective, constraints)
+            expanded = self._greedy_expand_allocation(minima, totals, weapon, objective, constraints, resolved_build_level)
+            refined = self._refine_allocation(minima, expanded, totals, weapon, objective, constraints, resolved_build_level)
+            utility = self._allocation_utility(refined, totals, weapon, objective, constraints, resolved_build_level)
             if best_utility is None or utility > best_utility:
                 best_allocation = refined
                 best_utility = utility
@@ -1347,18 +1584,20 @@ class WynnBuildEngine:
         weapon: dict[str, Any] | None,
         preferred_metric: str | OptimizationObjective,
         constraints: tuple[OptimizationConstraint, ...],
+        build_level: int,
     ) -> tuple[int, int, int, int, int]:
         current = list(minima)
-        current_utility = self._allocation_utility(tuple(current), totals, weapon, preferred_metric, constraints)
+        current_utility = self._allocation_utility(tuple(current), totals, weapon, preferred_metric, constraints, build_level)
+        available_skill_points = level_to_skill_points(build_level)
 
-        while sum(current) < LEVEL_105_TOTAL_SKILL_POINTS:
+        while sum(current) < available_skill_points:
             best_index: int | None = None
             best_utility: tuple[float, ...] | None = None
             for skill_index in range(5):
-                if current[skill_index] >= LEVEL_105_MAX_BASE_SKILL:
+                if current[skill_index] >= MAX_BASE_SKILL_POINTS:
                     continue
                 current[skill_index] += 1
-                utility = self._allocation_utility(tuple(current), totals, weapon, preferred_metric, constraints)
+                utility = self._allocation_utility(tuple(current), totals, weapon, preferred_metric, constraints, build_level)
                 current[skill_index] -= 1
                 if best_utility is None or utility > best_utility:
                     best_index = skill_index
@@ -1380,9 +1619,10 @@ class WynnBuildEngine:
         weapon: dict[str, Any] | None,
         preferred_metric: str | OptimizationObjective,
         constraints: tuple[OptimizationConstraint, ...],
+        build_level: int,
     ) -> tuple[int, int, int, int, int]:
         current = list(allocation)
-        current_utility = self._allocation_utility(tuple(current), totals, weapon, preferred_metric, constraints)
+        current_utility = self._allocation_utility(tuple(current), totals, weapon, preferred_metric, constraints, build_level)
 
         improved = True
         while improved:
@@ -1391,11 +1631,11 @@ class WynnBuildEngine:
                 if current[take_index] <= minima[take_index]:
                     continue
                 for give_index in range(5):
-                    if give_index == take_index or current[give_index] >= LEVEL_105_MAX_BASE_SKILL:
+                    if give_index == take_index or current[give_index] >= MAX_BASE_SKILL_POINTS:
                         continue
                     current[take_index] -= 1
                     current[give_index] += 1
-                    utility = self._allocation_utility(tuple(current), totals, weapon, preferred_metric, constraints)
+                    utility = self._allocation_utility(tuple(current), totals, weapon, preferred_metric, constraints, build_level)
                     if utility > current_utility:
                         current_utility = utility
                         improved = True
@@ -1414,17 +1654,18 @@ class WynnBuildEngine:
         weapon: dict[str, Any] | None,
         preferred_metric: str | OptimizationObjective,
         constraints: tuple[OptimizationConstraint, ...],
+        build_level: int,
     ) -> tuple[float, ...]:
         objective = coerce_optimization_objective(preferred_metric)
         satisfied = 1.0
         penalty = 0.0
         for constraint in constraints:
-            value = self._metric_value_from_parts(constraint.metric_key, totals, weapon, allocation)
+            value = self._metric_value_from_parts(constraint.metric_key, totals, weapon, allocation, build_level)
             if not BuildOptimizer._constraint_matches(value, constraint):
                 satisfied = 0.0
                 penalty += BuildOptimizer._constraint_penalty(value, constraint)
 
-        primary_score = self._allocation_objective_value(objective, totals, weapon, allocation)
+        primary_score = self._allocation_objective_value(objective, totals, weapon, allocation, build_level)
         return (
             satisfied,
             -penalty,
@@ -1439,6 +1680,7 @@ class WynnBuildEngine:
         totals: dict[str, float],
         weapon: dict[str, Any] | None,
         allocation: tuple[int, int, int, int, int],
+        build_level: int,
     ) -> float:
         strategy = allocation_strategy_for_metric(preferred_metric)
         if strategy == "mana":
@@ -1446,7 +1688,7 @@ class WynnBuildEngine:
             return float(effective_int) + (self._skill_effect_percentage("int", effective_int) / 100.0)
         if strategy == "minimal":
             return 0.0
-        return self._metric_value_from_parts(preferred_metric, totals, weapon, allocation)
+        return self._metric_value_from_parts(preferred_metric, totals, weapon, allocation, build_level)
 
     def _allocation_objective_value(
         self,
@@ -1454,14 +1696,15 @@ class WynnBuildEngine:
         totals: dict[str, float],
         weapon: dict[str, Any] | None,
         allocation: tuple[int, int, int, int, int],
+        build_level: int,
     ) -> float:
         if objective.is_single_metric():
-            return self._allocation_support_value(objective.primary_metric_key(), totals, weapon, allocation)
+            return self._allocation_support_value(objective.primary_metric_key(), totals, weapon, allocation, build_level)
 
         total = 0.0
         for index, term in enumerate(objective.terms):
-            support_value = self._allocation_support_value(term.metric_key, totals, weapon, allocation)
-            reference_scale = self._allocation_reference_scale(term.metric_key, totals, weapon, allocation)
+            support_value = self._allocation_support_value(term.metric_key, totals, weapon, allocation, build_level)
+            reference_scale = self._allocation_reference_scale(term.metric_key, totals, weapon, allocation, build_level)
             scale = objective.scale_for_index(index, reference_scale)
             total += objective.normalized_weight(index) * (support_value / scale)
         return total
@@ -1472,39 +1715,44 @@ class WynnBuildEngine:
         totals: dict[str, float],
         weapon: dict[str, Any] | None,
         allocation: tuple[int, int, int, int, int],
+        build_level: int,
     ) -> float:
         if metric_key in MANA_ALLOCATION_METRICS:
             optimistic = list(allocation)
-            optimistic[2] = LEVEL_105_MAX_BASE_SKILL
-            return self._allocation_support_value(metric_key, totals, weapon, tuple(optimistic))
+            optimistic[2] = MAX_BASE_SKILL_POINTS
+            return self._allocation_support_value(metric_key, totals, weapon, tuple(optimistic), build_level)
 
         optimistic = []
-        remaining = LEVEL_105_TOTAL_SKILL_POINTS
+        remaining = level_to_skill_points(build_level)
         for index, base_value in enumerate(allocation):
             optimistic_value = max(int(base_value), 0)
-            optimistic_value = min(LEVEL_105_MAX_BASE_SKILL, optimistic_value)
+            optimistic_value = min(MAX_BASE_SKILL_POINTS, optimistic_value)
             optimistic.append(optimistic_value)
             remaining -= optimistic_value
         skill_priority = {
             "melee_avg": ("str", "dex"),
             "spell_avg": ("str", "dex", "int"),
             "effective_hp": ("def", "agi"),
+            "effective_hp_no_agi": ("def",),
+            "effective_hpr": ("def", "agi"),
+            "effective_hpr_no_agi": ("def",),
+            "effective_ls": ("def", "agi"),
         }.get(metric_key, ())
         for skill_name in skill_priority:
             skill_index = SKILLS.index(skill_name)
-            take = min(remaining, LEVEL_105_MAX_BASE_SKILL - optimistic[skill_index])
+            take = min(remaining, MAX_BASE_SKILL_POINTS - optimistic[skill_index])
             optimistic[skill_index] += take
             remaining -= take
             if remaining <= 0:
                 break
         if remaining > 0:
             for skill_index in range(5):
-                take = min(remaining, LEVEL_105_MAX_BASE_SKILL - optimistic[skill_index])
+                take = min(remaining, MAX_BASE_SKILL_POINTS - optimistic[skill_index])
                 optimistic[skill_index] += take
                 remaining -= take
                 if remaining <= 0:
                     break
-        return max(1.0, self._metric_value_from_parts(metric_key, totals, weapon, tuple(optimistic)))
+        return max(1.0, self._metric_value_from_parts(metric_key, totals, weapon, tuple(optimistic), build_level))
 
     def _metric_value_from_parts(
         self,
@@ -1512,17 +1760,18 @@ class WynnBuildEngine:
         totals: dict[str, float],
         weapon: dict[str, Any] | None,
         allocation: tuple[int, int, int, int, int],
+        build_level: int,
     ) -> float:
-        if metric_key == "hp_total":
-            return float(totals.get("hp", 0.0) + totals.get("hpBonus", 0.0))
-
         effective_skills = {
             skill: int(allocation[index] + totals.get(skill, 0.0))
             for index, skill in enumerate(SKILLS)
         }
+        derived_stats = self._build_derived_stats(totals, effective_skills, weapon, build_level)
 
-        if metric_key == "effective_hp":
-            return self._effective_hp_value(totals, effective_skills)
+        if metric_key in SKILLS:
+            return float(effective_skills[metric_key])
+        if metric_key in derived_stats:
+            return float(derived_stats[metric_key])
         if metric_key in {"melee_avg", "spell_avg"} and weapon is not None:
             profiles = self._compute_damage_profiles(weapon, totals, effective_skills)
             profile = profiles.get("Melee" if metric_key == "melee_avg" else "Spell")
@@ -1733,7 +1982,7 @@ class WynnBuildEngine:
             crit_chance=crit_chance,
             spell_multiplier=1.0,
             attack_speed_multiplier=1.0,
-            attack_speed_label=str(weapon.get("atkSpd", "UNKNOWN")).replace("_", " ").title(),
+            attack_speed_label=display_attack_speed_label(weapon.get("atkSpd", "UNKNOWN")),
         )
 
         generic_spell_base = self._build_generic_spell_damage_map(weapon, base_damage)
@@ -1800,25 +2049,76 @@ class WynnBuildEngine:
         spell_multiplier: float,
         attack_speed_multiplier: float,
     ) -> dict[str, DamageRange]:
+        specific_prefix = "Md" if attack_type == "melee" else "Sd"
+        present = {
+            element: not (
+                math.isclose(damage_map[element].minimum, 0.0, abs_tol=1e-9)
+                and math.isclose(damage_map[element].maximum, 0.0, abs_tol=1e-9)
+            )
+            for element in ELEMENT_ORDER
+        }
+        saved_pre_boost = deep_copy_damage_map(damage_map)
         result = deep_copy_damage_map(damage_map)
 
+        static_boost = (
+            totals.get(f"{specific_prefix.lower()}Pct", 0.0)
+            + totals.get("damPct", 0.0)
+        ) / 100.0
+        total_min = sum(saved_pre_boost[element].minimum for element in ELEMENT_ORDER)
+        total_max = sum(saved_pre_boost[element].maximum for element in ELEMENT_ORDER)
+        total_elem_min = total_min - saved_pre_boost["n"].minimum
+        total_elem_max = total_max - saved_pre_boost["n"].maximum
+
         for element in ELEMENT_ORDER:
-            boost_percent = self._damage_boost_percent(element, attack_type, totals, effective_skills, crit)
-            result[element].multiply(max(0.0, 1.0 + (boost_percent / 100.0)))
-            result[element].clamp_non_negative()
+            damage_boost = 1.0 + static_boost
+            damage_boost += (
+                totals.get(f"{element}{specific_prefix}Pct", 0.0)
+                + totals.get(f"{element}DamPct", 0.0)
+            ) / 100.0
+            if element != "n":
+                skill_name = ELEMENT_TO_SKILL[element]
+                damage_boost += self._skill_damage_fraction(skill_name, effective_skills[skill_name])
+                damage_boost += (
+                    totals.get(f"r{specific_prefix}Pct", 0.0)
+                    + totals.get("rDamPct", 0.0)
+                ) / 100.0
+            result[element].multiply(damage_boost)
 
-        if attack_type == "spell":
-            for damage_range in result.values():
-                damage_range.multiply(attack_speed_multiplier)
+        prop_raw = totals.get(f"{specific_prefix.lower()}Raw", 0.0) + totals.get("damRaw", 0.0)
+        rainbow_raw = totals.get(f"r{specific_prefix}Raw", 0.0) + totals.get("rDamRaw", 0.0)
 
         for element in ELEMENT_ORDER:
-            raw_bonus = self._raw_damage_bonus(element, attack_type, totals)
-            result[element].add(raw_bonus)
-            result[element].clamp_non_negative()
+            element_raw = 0.0
+            if present[element]:
+                element_raw += totals.get(f"{element}{specific_prefix}Raw", 0.0)
+                element_raw += totals.get(f"{element}DamRaw", 0.0)
+            min_boost = element_raw
+            max_boost = element_raw
+            saved = saved_pre_boost[element]
 
-        if attack_type == "spell":
-            for damage_range in result.values():
-                damage_range.multiply(spell_multiplier)
+            if total_max > 0.0:
+                if math.isclose(total_min, 0.0, abs_tol=1e-9):
+                    min_boost += (saved.maximum / total_max) * prop_raw
+                else:
+                    min_boost += (saved.minimum / total_min) * prop_raw
+                max_boost += (saved.maximum / total_max) * prop_raw
+
+            if element != "n" and total_elem_max > 0.0:
+                if math.isclose(total_elem_min, 0.0, abs_tol=1e-9):
+                    min_boost += (saved.maximum / total_elem_max) * rainbow_raw
+                else:
+                    min_boost += (saved.minimum / total_elem_min) * rainbow_raw
+                max_boost += (saved.maximum / total_elem_max) * rainbow_raw
+
+            result[element].add(min_boost, max_boost)
+
+        strength_boost = 1.0 + self._skill_damage_fraction("str", effective_skills["str"])
+        crit_multiplier = 1.0 + (totals.get("critDamPct", 0.0) / 100.0)
+        final_multiplier = strength_boost + crit_multiplier if crit else strength_boost
+
+        for element in ELEMENT_ORDER:
+            result[element].multiply(final_multiplier)
+            result[element].clamp_non_negative()
 
         return result
 
@@ -1830,84 +2130,171 @@ class WynnBuildEngine:
         effective_skills: dict[str, int],
         crit: bool,
     ) -> float:
-        generic_percent_key = "mdPct" if attack_type == "melee" else "sdPct"
-        rainbow_percent_key = "rMdPct" if attack_type == "melee" else "rSdPct"
-        element_percent_suffix = "MdPct" if attack_type == "melee" else "SdPct"
-        critical_bonus = 100.0 + totals.get("critDamPct", 0.0) if crit else 0.0
-
-        boost = totals.get("damPct", 0.0) + totals.get(generic_percent_key, 0.0)
-        boost += self._skill_effect_percentage("str", effective_skills["str"])
-
-        if element == "n":
-            boost += totals.get("nDamPct", 0.0)
-            boost += totals.get(f"n{element_percent_suffix}", 0.0)
-        else:
-            element_skill = ELEMENT_TO_SKILL[element]
-            elemental_skill_bonus = self._skill_effect_percentage(element_skill, effective_skills[element_skill])
-            boost += totals.get("rDamPct", 0.0)
-            boost += totals.get(rainbow_percent_key, 0.0)
-            boost += totals.get(f"{element}DamPct", 0.0)
-            boost += totals.get(f"{element}{element_percent_suffix}", 0.0)
-            boost += elemental_skill_bonus
-            if crit and element == "t" and elemental_skill_bonus > 0.0:
-                boost += (elemental_skill_bonus * critical_bonus) / 100.0
-
-        if crit:
-            boost += critical_bonus
-
+        specific_prefix = "Md" if attack_type == "melee" else "Sd"
+        boost = totals.get(f"{specific_prefix.lower()}Pct", 0.0) + totals.get("damPct", 0.0)
+        boost += totals.get(f"{element}{specific_prefix}Pct", 0.0) + totals.get(f"{element}DamPct", 0.0)
+        if element != "n":
+            boost += totals.get(f"r{specific_prefix}Pct", 0.0) + totals.get("rDamPct", 0.0)
+            skill_name = ELEMENT_TO_SKILL[element]
+            boost += self._skill_damage_fraction(skill_name, effective_skills[skill_name]) * 100.0
         return boost
 
     @staticmethod
     def _raw_damage_bonus(element: str, attack_type: str, totals: dict[str, float]) -> float:
-        generic_attack_raw_key = "mdRaw" if attack_type == "melee" else "sdRaw"
-        rainbow_attack_raw_key = "rMdRaw" if attack_type == "melee" else "rSdRaw"
-        element_raw_suffix = "MdRaw" if attack_type == "melee" else "SdRaw"
-
-        if element == "n":
-            return (
-                totals.get("damRaw", 0.0)
-                + totals.get(generic_attack_raw_key, 0.0)
-                + totals.get("nDamRaw", 0.0)
-                + totals.get(f"n{element_raw_suffix}", 0.0)
-            )
-
-        return (
-            totals.get(f"{element}DamRaw", 0.0)
-            + totals.get(f"{element}{element_raw_suffix}", 0.0)
-            + totals.get("rDamRaw", 0.0)
-            + totals.get(rainbow_attack_raw_key, 0.0)
-        )
+        specific_prefix = "Md" if attack_type == "melee" else "Sd"
+        bonus = totals.get("damRaw", 0.0) + totals.get(f"{specific_prefix.lower()}Raw", 0.0)
+        bonus += totals.get(f"{element}DamRaw", 0.0) + totals.get(f"{element}{specific_prefix}Raw", 0.0)
+        if element != "n":
+            bonus += totals.get("rDamRaw", 0.0) + totals.get(f"r{specific_prefix}Raw", 0.0)
+        return bonus
 
     @staticmethod
     def _skill_percentage(points: int) -> float:
-        safe_points = max(0, min(150, int(points)))
-        return SKILL_PERCENTAGES[safe_points]
+        return skill_points_to_percentage(points) * 100.0
+
+    @classmethod
+    def _skill_effect_fraction(cls, skill: str, points: int) -> float:
+        return skill_points_to_percentage(points) * SKILLPOINT_FINAL_MULTIPLIERS.get(skill, 1.0)
+
+    @classmethod
+    def _skill_damage_fraction(cls, skill: str, points: int) -> float:
+        return skill_points_to_percentage(points) * SKILLPOINT_DAMAGE_MULTIPLIERS.get(skill, 1.0)
 
     @classmethod
     def _skill_effect_percentage(cls, skill: str, points: int) -> float:
-        base_percentage = cls._skill_percentage(points)
-        if skill == "def":
-            return base_percentage * DEFENCE_SKILL_SCALE
-        if skill == "agi":
-            return base_percentage * AGILITY_SKILL_SCALE
-        return base_percentage
+        return cls._skill_effect_fraction(skill, points) * 100.0
 
     @classmethod
     def _intelligence_spell_cost_reduction_percentage(cls, points: int) -> float:
-        scaled_intelligence = cls._skill_effect_percentage("int", points)
-        if scaled_intelligence <= 0.0:
-            return 0.0
-        return 50.0 * (scaled_intelligence / MAX_SCALED_SKILL_PERCENTAGE)
+        return cls._skill_effect_fraction("int", points) * 100.0
 
-    def _effective_hp_value(self, totals: dict[str, float], effective_skills: dict[str, int]) -> float:
-        base_hp = float(totals.get("hp", 0.0) + totals.get("hpBonus", 0.0))
-        if base_hp <= 0:
-            return 0.0
+    @staticmethod
+    def _class_defense_multiplier(weapon: dict[str, Any] | None) -> float:
+        if weapon is None:
+            return DEFAULT_CLASS_DEFENSE
+        return CLASS_DEFENSE_MULTIPLIERS.get(str(weapon.get("type", "") or "").lower(), DEFAULT_CLASS_DEFENSE)
 
-        defense_reduction = self._skill_effect_percentage("def", effective_skills["def"]) / 100.0
-        dodge_chance = self._skill_effect_percentage("agi", effective_skills["agi"]) / 100.0
-        expected_damage_multiplier = (dodge_chance * 0.1) + ((1.0 - dodge_chance) * (1.0 - defense_reduction))
-        return base_hp / max(1e-9, expected_damage_multiplier)
+    def _base_spell_cost(
+        self,
+        totals: dict[str, float],
+        effective_skills: dict[str, int],
+        weapon: dict[str, Any] | None,
+        spell_index: int,
+    ) -> float:
+        if weapon is None or not (1 <= spell_index <= 4):
+            return 0.0
+        base_costs = SPELL_BASE_COSTS_BY_WEAPON.get(str(weapon.get("type", "") or "").lower())
+        if not base_costs:
+            return 0.0
+        base_cost = base_costs[spell_index - 1]
+        reduced = base_cost * (1.0 - self._skill_effect_fraction("int", effective_skills["int"]))
+        reduced += totals.get(f"spRaw{spell_index}", 0.0)
+        return reduced * (1.0 + (totals.get(f"spPct{spell_index}", 0.0) / 100.0))
+
+    def _spell_cost(
+        self,
+        totals: dict[str, float],
+        effective_skills: dict[str, int],
+        weapon: dict[str, Any] | None,
+        spell_index: int,
+    ) -> float:
+        base_cost = self._base_spell_cost(totals, effective_skills, weapon, spell_index)
+        if base_cost <= 0.0:
+            return 0.0
+        return max(1.0, base_cost)
+
+    def _build_derived_stats(
+        self,
+        totals: dict[str, float],
+        effective_skills: dict[str, int],
+        weapon: dict[str, Any] | None,
+        build_level: int,
+    ) -> dict[str, float]:
+        resolved_build_level = clamp_build_level(build_level)
+        total_hp = float(level_to_hp_base(resolved_build_level) + totals.get("hp", 0.0) + totals.get("hpBonus", 0.0))
+        total_hp = max(5.0, total_hp)
+
+        def_pct = self._skill_effect_fraction("def", effective_skills["def"])
+        agi_pct = self._skill_effect_fraction("agi", effective_skills["agi"])
+        class_def = self._class_defense_multiplier(weapon)
+        def_mult = 2.0 - class_def
+        agi_reduction = (100.0 - DEFAULT_AGILITY_DEFENSE) / 100.0
+
+        with_agi_denominator = (agi_reduction * agi_pct) + ((1.0 - agi_pct) * (1.0 - def_pct))
+        with_agi_denominator *= def_mult
+        no_agi_denominator = (1.0 - def_pct) * def_mult
+
+        effective_hp = total_hp / max(1e-9, with_agi_denominator)
+        effective_hp_no_agi = total_hp / max(1e-9, no_agi_denominator)
+
+        hpr_total = raw_to_pct(totals.get("hprRaw", 0.0), totals.get("hprPct", 0.0) / 100.0)
+        effective_hpr = hpr_total / max(1e-9, with_agi_denominator)
+        effective_hpr_no_agi = hpr_total / max(1e-9, no_agi_denominator)
+
+        elemental_defenses = {
+            f"{element}_def_total": raw_to_pct_uncapped(
+                totals.get(f"{element}Def", 0.0),
+                (totals.get(f"{element}DefPct", 0.0) + totals.get("rDefPct", 0.0)) / 100.0,
+            )
+            for element in ("e", "t", "w", "f", "a")
+        }
+
+        attack_speed_index = adjusted_attack_speed_index(weapon, totals)
+        attack_speed_multiplier = attack_speed_multiplier_from_index(attack_speed_index)
+        life_steal = totals.get("ls", 0.0)
+        mana_steal = totals.get("ms", 0.0)
+        if attack_speed_multiplier is None or attack_speed_multiplier <= 0.0:
+            life_per_hit = 0.0
+            mana_per_hit = 0.0
+        else:
+            life_per_hit = float(round(life_steal / 3.0 / attack_speed_multiplier))
+            mana_per_hit = round((mana_steal / 3.0 / attack_speed_multiplier) * 10.0) / 10.0
+
+        effective_ls = 0.0
+        if total_hp > 0.0 and not math.isclose(life_steal, 0.0, abs_tol=1e-9):
+            effective_ls = float(round((effective_hp * life_steal) / total_hp))
+
+        derived_stats = {
+            "total_hp": total_hp,
+            "hp_total": total_hp,
+            "effective_hp": effective_hp,
+            "effective_hp_no_agi": effective_hp_no_agi,
+            "hpr_total": hpr_total,
+            "effective_hpr": effective_hpr,
+            "effective_hpr_no_agi": effective_hpr_no_agi,
+            "def_pct": def_pct * 100.0,
+            "agi_pct": agi_pct * 100.0,
+            "mr_total": totals.get("mr", 0.0) + 25.0,
+            "effective_ls": effective_ls,
+            "life_per_hit": life_per_hit,
+            "mana_per_hit": mana_per_hit,
+        }
+        derived_stats.update(elemental_defenses)
+        for spell_index in range(1, 5):
+            derived_stats[f"spell_cost_{spell_index}"] = self._spell_cost(totals, effective_skills, weapon, spell_index)
+        return derived_stats
+
+    def _effective_hp_value(
+        self,
+        totals: dict[str, float],
+        effective_skills: dict[str, int],
+        weapon: dict[str, Any] | None = None,
+        build_level: int | None = None,
+        include_agi: bool = True,
+    ) -> float:
+        derived = self._build_derived_stats(totals, effective_skills, weapon, clamp_build_level(build_level))
+        return derived["effective_hp" if include_agi else "effective_hp_no_agi"]
+
+    def _effective_hpr_value(
+        self,
+        totals: dict[str, float],
+        effective_skills: dict[str, int],
+        weapon: dict[str, Any] | None = None,
+        build_level: int | None = None,
+        include_agi: bool = True,
+    ) -> float:
+        derived = self._build_derived_stats(totals, effective_skills, weapon, clamp_build_level(build_level))
+        return derived["effective_hpr" if include_agi else "effective_hpr_no_agi"]
 
     def set_bonus_for_count(self, set_name: str, piece_count: int) -> dict[str, float]:
         if piece_count <= 0:
@@ -1939,10 +2326,10 @@ class WynnBuildEngine:
         return total
 
     def metric_value_from_result(self, result: BuildResult, metric_key: str) -> float:
-        if metric_key == "hp_total":
-            return float(result.gear_health_bonus)
-        if metric_key == "effective_hp":
-            return self._effective_hp_value(result.totals, result.effective_skills)
+        if metric_key in SKILLS:
+            return float(result.effective_skills[metric_key])
+        if metric_key in result.derived_stats:
+            return float(result.derived_stats[metric_key])
         if metric_key == "melee_avg":
             profile = result.damage_profiles.get("Melee")
             return expected_average_from_profile(profile) if profile else 0.0
@@ -1957,14 +2344,15 @@ class WynnBuildEngine:
         weapon: dict[str, Any] | None,
         allocation: tuple[int, int, int, int, int],
         objective: str | OptimizationObjective,
+        build_level: int,
     ) -> float:
         objective_spec = coerce_optimization_objective(objective)
         if objective_spec.is_single_metric():
-            return self._metric_value_from_parts(objective_spec.primary_metric_key(), totals, weapon, allocation)
+            return self._metric_value_from_parts(objective_spec.primary_metric_key(), totals, weapon, allocation, build_level)
 
         total = 0.0
         for index, term in enumerate(objective_spec.terms):
-            raw_value = self._metric_value_from_parts(term.metric_key, totals, weapon, allocation)
+            raw_value = self._metric_value_from_parts(term.metric_key, totals, weapon, allocation, build_level)
             scale = objective_spec.scale_for_index(index, raw_value)
             total += objective_spec.normalized_weight(index) * (raw_value / scale)
         return total
@@ -1973,8 +2361,10 @@ class WynnBuildEngine:
         self,
         solution: SearchSolution,
         objective: str | OptimizationObjective,
+        build_level: int,
     ) -> BuildResult:
         objective_spec = coerce_optimization_objective(objective)
+        resolved_build_level = clamp_build_level(build_level)
         selections = solution.selections_dict()
         selected_items = {
             slot_label: self.item_lookup[label]
@@ -1991,12 +2381,14 @@ class WynnBuildEngine:
         }
         weapon = selected_items.get("Weapon")
         weapon_class = None
+        derived_stats = self._build_derived_stats(totals, effective_skills, weapon, resolved_build_level)
         damage_profiles: dict[str, DamageProfile] = {}
         if weapon:
             weapon_class = weapon.get("classReq") or WEAPON_CLASS_NAMES.get(str(weapon.get("type")))
             damage_profiles = self._compute_damage_profiles(weapon, totals, effective_skills)
 
         return BuildResult(
+            build_level=resolved_build_level,
             selected_items=selected_items,
             base_skills=base_skills,
             base_skill_total=sum(base_skills.values()),
@@ -2014,6 +2406,7 @@ class WynnBuildEngine:
             gear_health_bonus=totals.get("hp", 0.0) + totals.get("hpBonus", 0.0),
             weapon_class=weapon_class,
             weapon=weapon,
+            derived_stats=derived_stats,
             damage_profiles=damage_profiles,
         )
 
@@ -2053,24 +2446,30 @@ class WynnBuildEngine:
         return breakdown
 
     def _result_reference_scale(self, result: BuildResult, metric_key: str) -> float:
-        if metric_key == "hp_total":
-            return max(1.0, float(result.gear_health_bonus))
-        if metric_key == "effective_hp":
-            return max(1.0, self._effective_hp_value(result.totals, result.effective_skills))
         if metric_key == "melee_avg":
             if result.weapon is None:
                 return 1.0
-            optimistic = {skill: max(result.base_skills.get(skill, 0), LEVEL_105_MAX_BASE_SKILL) + int(result.totals.get(skill, 0.0)) for skill in SKILLS}
+            optimistic = {
+                skill: max(result.base_skills.get(skill, 0), MAX_BASE_SKILL_POINTS) + int(result.totals.get(skill, 0.0))
+                for skill in SKILLS
+            }
             profiles = self._compute_damage_profiles(result.weapon, result.totals, optimistic)
             profile = profiles.get("Melee")
             return max(1.0, expected_average_from_profile(profile) if profile else 0.0)
         if metric_key == "spell_avg":
             if result.weapon is None:
                 return 1.0
-            optimistic = {skill: max(result.base_skills.get(skill, 0), LEVEL_105_MAX_BASE_SKILL) + int(result.totals.get(skill, 0.0)) for skill in SKILLS}
+            optimistic = {
+                skill: max(result.base_skills.get(skill, 0), MAX_BASE_SKILL_POINTS) + int(result.totals.get(skill, 0.0))
+                for skill in SKILLS
+            }
             profiles = self._compute_damage_profiles(result.weapon, result.totals, optimistic)
             profile = profiles.get("Spell")
             return max(1.0, expected_average_from_profile(profile) if profile else 0.0)
+        if metric_key in SKILLS:
+            return max(1.0, abs(float(result.effective_skills.get(metric_key, 0))) or 1.0)
+        if metric_key in result.derived_stats:
+            return max(1.0, abs(float(result.derived_stats.get(metric_key, 0.0))) or 1.0)
         return max(1.0, abs(float(result.totals.get(metric_key, 0.0))) or 1.0)
 
 
@@ -2092,6 +2491,7 @@ class BuildOptimizer:
         self._all_set_caps: dict[str, int] = {}
         self._all_melee_base: float = 0.0
         self._all_spell_base: float = 0.0
+        self._current_build_level: int = clamp_build_level(DEFAULT_BUILD_LEVEL_FALLBACK)
         self._reward_scale_hint: float = 1.0
         self._prepared_space_cache: dict[tuple[Any, ...], PreparedSearchSpace] = {}
         self._materialized_option_cache: dict[tuple[Any, ...], BuildOption] = {}
@@ -2112,16 +2512,18 @@ class BuildOptimizer:
         constraints: list[OptimizationConstraint],
         max_combat_level: int | None,
     ) -> tuple[Any, ...]:
+        resolved_build_level = clamp_build_level(max_combat_level)
         return (
             selection_signature(required_selections),
             tuple(sorted({term.metric_key for term in objective_metric.terms})),
             tuple(sorted({constraint.metric_key for constraint in constraints})),
-            None if max_combat_level is None else int(max_combat_level),
+            resolved_build_level,
         )
 
     def _freeze_current_prepared_space(self, cache_id: tuple[Any, ...]) -> PreparedSearchSpace:
         return PreparedSearchSpace(
             cache_id=cache_id,
+            build_level=self._current_build_level,
             metric_keys_for_candidates=self._metric_keys_for_candidates,
             group_order=tuple(self._group_order),
             group_candidates=tuple(tuple(candidate for candidate in candidates) for candidates in self._group_candidates),
@@ -2138,6 +2540,7 @@ class BuildOptimizer:
         )
 
     def _load_prepared_space(self, prepared_space: PreparedSearchSpace) -> None:
+        self._current_build_level = clamp_build_level(prepared_space.build_level)
         self._metric_keys_for_candidates = prepared_space.metric_keys_for_candidates
         self._group_order = list(prepared_space.group_order)
         self._group_candidates = [list(group) for group in prepared_space.group_candidates]
@@ -2180,13 +2583,15 @@ class BuildOptimizer:
         max_combat_level: int | None = None,
     ) -> PreparedSearchSpace:
         raw_objective = coerce_optimization_objective(objective_metric)
+        resolved_build_level = clamp_build_level(max_combat_level)
         cache_id = self._prepared_search_cache_key(required_selections, raw_objective, constraints, max_combat_level)
         prepared_space = self._prepared_space_cache.get(cache_id)
         if prepared_space is None:
             self._objective = raw_objective
             self._constraints = tuple(constraints)
+            self._current_build_level = resolved_build_level
             self._metric_keys_for_candidates = self._build_candidate_metric_keys(raw_objective, constraints)
-            self._build_group_candidates(required_selections, max_combat_level)
+            self._build_group_candidates(required_selections, resolved_build_level)
             self._build_suffix_bounds()
             prepared_space = self._freeze_current_prepared_space(cache_id)
             self._prepared_space_cache[cache_id] = prepared_space
@@ -2579,12 +2984,13 @@ class BuildOptimizer:
         set_bonus_totals = self.engine.set_bonus_totals_from_counts(state.set_counts)
         totals = combine_dicts(state.item_totals, set_bonus_totals)
         weapon = self.engine.item_lookup.get(state.weapon_label) if state.weapon_label else None
-        base_skill_dict = self.engine._optimize_level_105_base_skills_from_minima(
+        base_skill_dict = self.engine._optimize_base_skills_from_minima(
             state.req_minima,
             totals,
             weapon,
             self._objective,
             self._constraints,
+            self._current_build_level,
         )
         if base_skill_dict is None:
             return None
@@ -2595,12 +3001,12 @@ class BuildOptimizer:
 
         constraint_values: list[tuple[str, float]] = []
         for constraint in self._constraints:
-            value = self.engine._metric_value_from_parts(constraint.metric_key, totals, weapon, allocation)
+            value = self.engine._metric_value_from_parts(constraint.metric_key, totals, weapon, allocation, self._current_build_level)
             constraint_values.append((constraint.display_label(), value))
             if not self._constraint_matches(value, constraint):
                 return None
 
-        score = self.engine.objective_value_from_parts(totals, weapon, allocation, self._objective)
+        score = self.engine.objective_value_from_parts(totals, weapon, allocation, self._objective, self._current_build_level)
         return SearchSolution(
             score=score,
             objective_value=score,
@@ -2635,7 +3041,7 @@ class BuildOptimizer:
         cached = self._materialized_option_cache.get(cache_key)
         if cached is not None:
             return cached
-        result = self.engine.build_result_from_solution(solution, self._objective)
+        result = self.engine.build_result_from_solution(solution, self._objective, self._current_build_level)
         option = BuildOption(
             score=solution.score,
             selections=solution.selections_dict(),
@@ -2758,10 +3164,9 @@ class BuildOptimizer:
         upper_totals: dict[str, float],
         metric_key: str,
     ) -> float:
-        if metric_key == "hp_total":
-            return upper_totals.get("hp", 0.0) + upper_totals.get("hpBonus", 0.0)
-        if metric_key == "effective_hp":
-            return self._effective_hp_upper_bound(upper_totals, candidate.req_minima)
+        weapon = self.engine.item_lookup.get(candidate.weapon_label) if candidate.weapon_label else None
+        if metric_key in DERIVED_STAT_LABELS or metric_key == "hp_total":
+            return self._derived_metric_upper_bound(metric_key, upper_totals, candidate.req_minima, weapon)
         if metric_key == "melee_avg":
             base_total = candidate.totals.get(PSEUDO_MELEE_BASE, 0.0) or self._all_melee_base
             return self._damage_metric_upper_bound(base_total, upper_totals, "melee", candidate.req_minima)
@@ -3011,7 +3416,7 @@ class BuildOptimizer:
                     raise ValueError(f"Unknown required item for {slot_label}: {required_label}")
                 if max_combat_level is not None and fact.level_requirement > int(max_combat_level):
                     raise ValueError(
-                        f"{required_label} requires combat level {fact.level_requirement}, above the current filter of {int(max_combat_level)}."
+                        f"{required_label} requires build level {fact.level_requirement}, above the current build level of {int(max_combat_level)}."
                     )
                 filtered_singletons[slot_label] = [
                     self._make_candidate_from_facts(slot_label, {slot_label: fact.label}, (fact,))
@@ -3040,7 +3445,7 @@ class BuildOptimizer:
                 fact1.level_requirement > int(max_combat_level) or fact2.level_requirement > int(max_combat_level)
             ):
                 raise ValueError(
-                    f"Required rings must be at or below combat level {int(max_combat_level)}."
+                    f"Required rings must be at or below build level {int(max_combat_level)}."
                 )
             ring_pairs = [self._make_candidate_from_facts("Rings", {"Ring 1": ring1_required, "Ring 2": ring2_required}, (fact1, fact2))]
         elif ring1_required or ring2_required:
@@ -3051,7 +3456,7 @@ class BuildOptimizer:
                 raise ValueError(f"Unknown required ring: {ring1_required or ring2_required}")
             if max_combat_level is not None and fixed_item.level_requirement > int(max_combat_level):
                 raise ValueError(
-                    f"{fixed_item.label} requires combat level {fixed_item.level_requirement}, above the current filter of {int(max_combat_level)}."
+                    f"{fixed_item.label} requires build level {fixed_item.level_requirement}, above the current build level of {int(max_combat_level)}."
                 )
             for ring in ring_candidates:
                 ring_label = ring.item_labels[0]
@@ -3489,14 +3894,16 @@ class BuildOptimizer:
         return score - self._feasibility_penalty(candidate.req_minima)
 
     def _candidate_metric_sort_value(self, candidate: GroupCandidate, metric: str) -> float:
-        if metric == "hp_total":
-            return candidate.totals.get("hp", 0.0) + candidate.totals.get("hpBonus", 0.0)
-        if metric == "effective_hp":
-            return self._effective_hp_upper_bound(candidate.totals, candidate.req_minima)
+        weapon = self.engine.item_lookup.get(candidate.weapon_label) if candidate.weapon_label else None
+        if metric in DERIVED_STAT_LABELS or metric == "hp_total":
+            return self._derived_metric_upper_bound(metric, candidate.totals, candidate.req_minima, weapon)
         if metric == "melee_avg":
             return candidate.totals.get(PSEUDO_MELEE_BASE, 0.0) + candidate.totals.get("mdPct", 0.0) + candidate.totals.get("damPct", 0.0)
         if metric == "spell_avg":
             return candidate.totals.get(PSEUDO_SPELL_BASE, 0.0) + candidate.totals.get("sdPct", 0.0) + candidate.totals.get("damPct", 0.0)
+        if metric in SKILLS:
+            allocation = self._optimistic_base_allocation(candidate.req_minima, metric)
+            return candidate.totals.get(metric, 0.0) + allocation[SKILLS.index(metric)]
         return candidate.totals.get(metric, 0.0)
 
     def _base_skill_shortfall(self, req_minima: tuple[tuple[int, int, int, int, int], ...]) -> int:
@@ -3504,7 +3911,7 @@ class BuildOptimizer:
             return 0
 
         return min(
-            level_105_allocation_shortfall(minima)
+            base_skill_allocation_shortfall(minima, self._current_build_level)
             for minima in req_minima
         )
 
@@ -3665,10 +4072,9 @@ class BuildOptimizer:
         for key, value in set_bonus_bound.items():
             upper_totals[key] = upper_totals.get(key, 0.0) + value
 
-        if metric_key == "hp_total":
-            return upper_totals.get("hp", 0.0) + upper_totals.get("hpBonus", 0.0)
-        if metric_key == "effective_hp":
-            return self._effective_hp_upper_bound(upper_totals, state.req_minima)
+        weapon = self.engine.item_lookup.get(state.weapon_label) if state.weapon_label else None
+        if metric_key in DERIVED_STAT_LABELS or metric_key == "hp_total":
+            return self._derived_metric_upper_bound(metric_key, upper_totals, state.req_minima, weapon)
         if metric_key == "melee_avg":
             base_total = 0.0
             if state.weapon_label:
@@ -3687,6 +4093,26 @@ class BuildOptimizer:
             allocation = self._optimistic_base_allocation(state.req_minima, metric_key)
             return upper_totals.get(metric_key, 0.0) + allocation[SKILLS.index(metric_key)]
         return upper_totals.get(metric_key, 0.0)
+
+    def _derived_metric_upper_bound(
+        self,
+        metric_key: str,
+        totals: dict[str, float],
+        req_minima: tuple[tuple[int, int, int, int, int], ...],
+        weapon: dict[str, Any] | None,
+    ) -> float:
+        allocation = self._optimistic_base_allocation(req_minima, metric_key)
+        effective_skills = {
+            skill: int(allocation[index] + totals.get(skill, 0.0))
+            for index, skill in enumerate(SKILLS)
+        }
+        if weapon is None and metric_key in {"life_per_hit", "mana_per_hit"}:
+            best_speed = min(BASE_DAMAGE_MULTIPLIERS)
+            if metric_key == "life_per_hit":
+                return float(round(totals.get("ls", 0.0) / 3.0 / best_speed))
+            return round((totals.get("ms", 0.0) / 3.0 / best_speed) * 10.0) / 10.0
+        derived_stats = self.engine._build_derived_stats(totals, effective_skills, weapon, self._current_build_level)
+        return float(derived_stats.get(metric_key, 0.0))
 
     def _optimistic_set_bonus_totals(self, current_counts: dict[str, int], group_index: int) -> dict[str, float]:
         totals: defaultdict[str, float] = defaultdict(float)
@@ -3722,16 +4148,15 @@ class BuildOptimizer:
             self.engine._damage_boost_percent(element, attack_type, totals, effective_skills, False)
             for element in ELEMENT_ORDER
         )
-        best_crit = max(
-            self.engine._damage_boost_percent(element, attack_type, totals, effective_skills, True)
-            for element in ELEMENT_ORDER
-        )
         raw_total = sum(
             max(0.0, self.engine._raw_damage_bonus(element, attack_type, totals))
             for element in ELEMENT_ORDER
         )
-        noncrit_total = (base_total * max(0.0, 1.0 + (best_noncrit / 100.0))) + raw_total
-        crit_total = (base_total * max(0.0, 1.0 + (best_crit / 100.0))) + raw_total
+        strength_multiplier = 1.0 + self.engine._skill_damage_fraction("str", effective_skills["str"])
+        crit_multiplier = 1.0 + (totals.get("critDamPct", 0.0) / 100.0)
+        boosted_total = (base_total * max(0.0, 1.0 + (best_noncrit / 100.0))) + raw_total
+        noncrit_total = boosted_total * strength_multiplier
+        crit_total = boosted_total * (strength_multiplier + crit_multiplier)
         return (noncrit_total * (1.0 - crit_chance)) + (crit_total * crit_chance)
 
     def _effective_hp_upper_bound(
@@ -3744,7 +4169,7 @@ class BuildOptimizer:
             skill: int(allocation[index] + totals.get(skill, 0.0))
             for index, skill in enumerate(SKILLS)
         }
-        return self.engine._effective_hp_value(totals, effective_skills)
+        return self.engine._effective_hp_value(totals, effective_skills, None, self._current_build_level)
 
     def _optimistic_base_allocation(
         self,
@@ -3754,20 +4179,24 @@ class BuildOptimizer:
         if req_minima:
             base = min(
                 req_minima,
-                key=lambda values: (level_105_allocation_shortfall(values), sum(values), values),
+                key=lambda values: (base_skill_allocation_shortfall(values, self._current_build_level), sum(values), values),
             )
         else:
             base = (0, 0, 0, 0, 0)
 
         allocation = [
-            max(0, min(LEVEL_105_MAX_BASE_SKILL, int(base[index])))
+            max(0, min(MAX_BASE_SKILL_POINTS, int(base[index])))
             for index in range(5)
         ]
-        remaining = max(0, LEVEL_105_TOTAL_SKILL_POINTS - sum(allocation))
+        remaining = max(0, level_to_skill_points(self._current_build_level) - sum(allocation))
         priorities = {
             "melee_avg": ("str", "dex"),
             "spell_avg": ("str", "dex", "int"),
             "effective_hp": ("def", "agi"),
+            "effective_hp_no_agi": ("def",),
+            "effective_hpr": ("def", "agi"),
+            "effective_hpr_no_agi": ("def",),
+            "effective_ls": ("def", "agi"),
             "str": ("str",),
             "dex": ("dex",),
             "int": ("int",),
@@ -3777,14 +4206,14 @@ class BuildOptimizer:
 
         for skill_name in priorities:
             skill_index = SKILLS.index(skill_name)
-            take = min(remaining, LEVEL_105_MAX_BASE_SKILL - allocation[skill_index])
+            take = min(remaining, MAX_BASE_SKILL_POINTS - allocation[skill_index])
             allocation[skill_index] += take
             remaining -= take
             if remaining <= 0:
                 break
         if remaining > 0:
             for skill_index in range(5):
-                take = min(remaining, LEVEL_105_MAX_BASE_SKILL - allocation[skill_index])
+                take = min(remaining, MAX_BASE_SKILL_POINTS - allocation[skill_index])
                 allocation[skill_index] += take
                 remaining -= take
                 if remaining <= 0:
@@ -4368,7 +4797,7 @@ class WynnBuildTesterApp(tk.Tk):
         self.searchable_inputs: list[SearchableCombobox] = []
         self.slot_vars: dict[str, tk.StringVar] = {}
         self.slot_boxes: dict[str, SearchableCombobox] = {}
-        self.default_combat_level = max(1, int(engine.max_item_level or DEFAULT_COMBAT_LEVEL_FALLBACK))
+        self.default_combat_level = clamp_build_level(engine.max_item_level or DEFAULT_BUILD_LEVEL_FALLBACK)
         self._active_combat_level_filter = self.default_combat_level
         self.combat_level_var = tk.StringVar(value=str(self.default_combat_level))
         self.damage_view_var = tk.StringVar(value="Melee")
@@ -4385,7 +4814,7 @@ class WynnBuildTesterApp(tk.Tk):
         self.search_stop_event = threading.Event()
 
         self._build_layout()
-        self.add_objective_row("HP", "1")
+        self.add_objective_row("Total HP", "1")
         self.add_constraint_row()
         self._update_search_mode_controls()
         self._apply_theme()
@@ -4411,10 +4840,11 @@ class WynnBuildTesterApp(tk.Tk):
     @staticmethod
     def _default_generator_status() -> str:
         return (
-            "Current gear entries are treated as required, and only items at or below the combat-level filter are considered. "
+            "Current gear entries are treated as required, and only items at or below the current build level are considered. "
             "Base skills are auto-allocated per build for the selected "
             f"objective. Exact is optimal but slower; MCTS uses parallel processes and defaults to "
-            f"{default_mcts_worker_count(DETECTED_LOGICAL_CPUS)} worker(s) on this device."
+            f"{default_mcts_worker_count(DETECTED_LOGICAL_CPUS)} worker(s) on this device. "
+            "Spell Avg Damage remains a heuristic that ignores ability trees."
         )
 
     @staticmethod
@@ -4425,19 +4855,23 @@ class WynnBuildTesterApp(tk.Tk):
         text = self.combat_level_var.get().strip()
         if not text:
             if strict:
-                self.generator_status_var.set("Combat level is required before searching.")
+                self.generator_status_var.set("Build level is required before searching.")
             return None
         try:
             level = int(text)
         except ValueError:
             if strict:
-                self.generator_status_var.set("Combat level must be a whole number.")
+                self.generator_status_var.set("Build level must be a whole number.")
             return None
         if level < 1:
             if strict:
-                self.generator_status_var.set("Combat level must be at least 1.")
+                self.generator_status_var.set("Build level must be at least 1.")
             return None
-        return level
+        if level > MAX_BUILD_LEVEL:
+            if strict:
+                self.generator_status_var.set(f"Build level must be at most {MAX_BUILD_LEVEL}.")
+            return None
+        return clamp_build_level(level)
 
     def _refresh_slot_level_filters(self) -> None:
         for slot_label, combo in self.slot_boxes.items():
@@ -4653,7 +5087,7 @@ class WynnBuildTesterApp(tk.Tk):
         equipment_frame.pack(fill=tk.X)
 
         level_validator = (self.register(self._validate_integer_input), "%P")
-        ttk.Label(equipment_frame, text="Combat Level").grid(row=0, column=0, sticky="w", pady=4, padx=(0, 10))
+        ttk.Label(equipment_frame, text="Build Level").grid(row=0, column=0, sticky="w", pady=4, padx=(0, 10))
         ttk.Spinbox(
             equipment_frame,
             from_=1,
@@ -4817,7 +5251,7 @@ class WynnBuildTesterApp(tk.Tk):
             show="headings",
         )
         self.stats_tree.heading("stat", text="Stat")
-        self.stats_tree.heading("value", text="Total")
+        self.stats_tree.heading("value", text="Value")
         self.stats_tree.column("stat", width=260, anchor=tk.W)
         self.stats_tree.column("value", width=180, anchor=tk.E)
         self.stats_tree.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
@@ -5060,7 +5494,7 @@ class WynnBuildTesterApp(tk.Tk):
         for slot, value in required_selections.items():
             if value not in self.engine.slot_options_for_level(slot, combat_level):
                 self.generator_status_var.set(
-                    f"{slot} must be a recognized item at or below combat level {combat_level} before it can be required."
+                    f"{slot} must be a recognized item at or below build level {combat_level} before it can be required."
                 )
                 return None
 
@@ -5293,8 +5727,10 @@ class WynnBuildTesterApp(tk.Tk):
         result = option.result
         lines = [
             f"{option.objective_label}: {format_number(option.objective_value)}",
-            f"HP: {format_number(self.engine.metric_value_from_result(result, 'hp_total'))}",
+            f"Build Level: {result.build_level}",
+            f"Total HP: {format_number(self.engine.metric_value_from_result(result, 'hp_total'))}",
             f"Effective HP: {format_number(self.engine.metric_value_from_result(result, 'effective_hp'))}",
+            f"HP Regen Total: {format_number(self.engine.metric_value_from_result(result, 'hpr_total'))}",
             f"Melee Avg Damage: {format_number(self.engine.metric_value_from_result(result, 'melee_avg'))}",
             f"Spell Avg Damage: {format_number(self.engine.metric_value_from_result(result, 'spell_avg'))}",
         ]
@@ -5354,7 +5790,11 @@ class WynnBuildTesterApp(tk.Tk):
     def refresh_results(self) -> None:
         self._refresh_job = None
         objective = self._collect_objective(strict=False) or make_optimization_objective((("hp_total", 1.0),))
-        result = self.engine.build_result(self._current_selections(), objective)
+        result = self.engine.build_result(
+            self._current_selections(),
+            objective,
+            build_level=self._active_combat_level_filter,
+        )
         self._update_summary(result)
         self._update_damage(result)
         self._update_stats(result)
@@ -5363,6 +5803,8 @@ class WynnBuildTesterApp(tk.Tk):
         return {slot: variable.get() for slot, variable in self.slot_vars.items()}
 
     def _update_summary(self, result: BuildResult) -> None:
+        derived = result.derived_stats
+        available_skill_points = level_to_skill_points(result.build_level)
         lines: list[str] = []
 
         if result.selected_items:
@@ -5377,21 +5819,31 @@ class WynnBuildTesterApp(tk.Tk):
 
         lines.append("")
         lines.append("Build Summary")
-        lines.append(f"  Combat level filter: {self._active_combat_level_filter}")
+        lines.append(f"  Build level: {result.build_level}")
         lines.append(f"  Level requirement: {result.level_requirement}")
         lines.append(f"  Weapon class: {result.weapon_class or 'None'}")
-        lines.append(f"  Gear health bonus: {format_number(result.gear_health_bonus)}")
-        lines.append(f"  Effective HP: {format_number(self.engine.metric_value_from_result(result, 'effective_hp'))}")
+        lines.append(f"  Total HP: {format_number(derived['hp_total'])}")
+        lines.append(f"  Effective HP: {format_number(derived['effective_hp'])}")
+        lines.append(f"  Effective HP (No Agility): {format_number(derived['effective_hp_no_agi'])}")
+        lines.append(f"  HP Regen Total: {format_number(derived['hpr_total'])}")
+        lines.append(f"  Effective HP Regen: {format_number(derived['effective_hpr'])}")
+        lines.append(f"  Mana Regen Total: {format_number(derived['mr_total'])} / 5s")
+        lines.append(f"  Effective Life Steal: {format_number(derived['effective_ls'])} / 3s")
+        lines.append(f"  Life Per Hit: {format_number(derived['life_per_hit'])}")
+        lines.append(f"  Mana Per Hit: {format_number(derived['mana_per_hit'])}")
+
+        lines.append("")
+        lines.append("Elemental Defenses")
+        lines.append(f"  Earth: {format_number(derived['e_def_total'])}")
+        lines.append(f"  Thunder: {format_number(derived['t_def_total'])}")
+        lines.append(f"  Water: {format_number(derived['w_def_total'])}")
+        lines.append(f"  Fire: {format_number(derived['f_def_total'])}")
+        lines.append(f"  Air: {format_number(derived['a_def_total'])}")
 
         lines.append("")
         lines.append("Auto-Allocated Skill Points")
-        lines.append(
-            f"  Optimized for: {result.allocation_metric_label}"
-        )
-        lines.append(
-            f"  Base total: {result.base_skill_total} / {LEVEL_105_TOTAL_SKILL_POINTS} "
-            f"(max {LEVEL_105_MAX_BASE_SKILL} in one stat)"
-        )
+        lines.append(f"  Optimized for: {result.allocation_metric_label}")
+        lines.append(f"  Base total: {result.base_skill_total} / {available_skill_points} (max {MAX_BASE_SKILL_POINTS} in one stat)")
         for skill in SKILLS:
             base_value = result.base_skills[skill]
             bonus_value = result.totals.get(skill, 0.0)
@@ -5402,7 +5854,7 @@ class WynnBuildTesterApp(tk.Tk):
             )
 
         if result.weapon:
-            atk_speed = str(result.weapon.get("atkSpd", "UNKNOWN")).replace("_", " ").title()
+            atk_speed = display_attack_speed_label(result.weapon.get("atkSpd", "UNKNOWN"))
             average_dps = result.weapon.get("averageDps")
             if average_dps:
                 lines.append("")
@@ -5412,11 +5864,12 @@ class WynnBuildTesterApp(tk.Tk):
             spell_avg = self.engine.metric_value_from_result(result, "spell_avg")
             lines.append(f"Estimated melee average: {format_number(melee_avg)}")
             lines.append(f"Estimated spell average: {format_number(spell_avg)}")
+            lines.append("Spell Avg Damage remains a heuristic that ignores ability trees.")
 
         lines.append("")
         lines.append("Equip Order")
         if result.equip_order is None:
-            lines.append("  No stable equip order found within the level 105 skill-point budget.")
+            lines.append("  No stable equip order found within the current build-level skill-point budget.")
         elif not result.equip_order:
             lines.append("  No gear selected.")
         else:
@@ -5506,28 +5959,101 @@ class WynnBuildTesterApp(tk.Tk):
                 format_damage_range(crit_total),
             ),
         )
+        if profile.attack_type == "spell" and result.weapon is not None:
+            spell_labels = spell_cost_labels_for_weapon(result.weapon)
+            for index, spell_name in enumerate(spell_labels, start=1):
+                self.damage_tree.insert(
+                    "",
+                    tk.END,
+                    values=(
+                        f"{spell_name} Cost",
+                        f"{format_number(result.derived_stats[f'spell_cost_{index}'])} mana",
+                        "",
+                    ),
+                )
 
     def _update_stats(self, result: BuildResult) -> None:
         for row_id in self.stats_tree.get_children():
             self.stats_tree.delete(row_id)
+        rows: list[tuple[str, str]] = []
 
-        keys = [key for key in DISPLAY_STAT_ORDER if not math.isclose(result.totals.get(key, 0.0), 0.0, abs_tol=1e-9)]
-        remaining = sorted(
-            [
-                key
-                for key, value in result.totals.items()
-                if key not in STRUCTURAL_KEYS and key not in DISPLAY_STAT_ORDER and is_number(value) and not math.isclose(value, 0.0, abs_tol=1e-9)
-            ],
-            key=str.casefold,
-        )
-        keys.extend(remaining)
+        def add_numeric_row(label: str, value: float, *, include_zero: bool = False, suffix: str = "") -> None:
+            if not include_zero and math.isclose(value, 0.0, abs_tol=1e-9):
+                return
+            rows.append((label, f"{format_number(value)}{suffix}"))
 
-        if not keys:
-            self.stats_tree.insert("", tk.END, values=("No non-zero totals yet.", ""))
+        def add_percent_row(label: str, value: float, *, include_zero: bool = False) -> None:
+            if not include_zero and math.isclose(value, 0.0, abs_tol=1e-9):
+                return
+            rows.append((label, format_percent(value)))
+
+        derived = result.derived_stats
+        add_numeric_row("Total HP", derived["hp_total"], include_zero=True)
+        add_numeric_row("Effective HP", derived["effective_hp"], include_zero=True)
+        add_numeric_row("Effective HP (No Agility)", derived["effective_hp_no_agi"], include_zero=True)
+        add_numeric_row("HP Regen Total", derived["hpr_total"])
+        add_numeric_row("Effective HP Regen", derived["effective_hpr"])
+        add_numeric_row("Effective HP Regen (No Agility)", derived["effective_hpr_no_agi"])
+        add_percent_row("Defense %", derived["def_pct"])
+        add_percent_row("Agility %", derived["agi_pct"])
+        add_numeric_row("Earth Defense Total", derived["e_def_total"])
+        add_numeric_row("Thunder Defense Total", derived["t_def_total"])
+        add_numeric_row("Water Defense Total", derived["w_def_total"])
+        add_numeric_row("Fire Defense Total", derived["f_def_total"])
+        add_numeric_row("Air Defense Total", derived["a_def_total"])
+        add_numeric_row("Mana Regen Total", derived["mr_total"], suffix=" / 5s")
+        add_numeric_row("Effective Life Steal", derived["effective_ls"], suffix=" / 3s")
+        add_numeric_row("Life Per Hit", derived["life_per_hit"])
+        add_numeric_row("Mana Per Hit", derived["mana_per_hit"])
+        for skill in SKILLS:
+            add_numeric_row(f"{SKILL_LABELS[skill]} Total", result.effective_skills[skill], include_zero=True)
+
+        excluded_component_keys = {
+            *SKILLS,
+            "hp",
+            "hpBonus",
+            "hprRaw",
+            "hprPct",
+            "aDef",
+            "eDef",
+            "tDef",
+            "wDef",
+            "fDef",
+            "aDefPct",
+            "eDefPct",
+            "tDefPct",
+            "wDefPct",
+            "fDefPct",
+            "rDefPct",
+            "mr",
+            "ms",
+            "ls",
+            "spPct1",
+            "spPct2",
+            "spPct3",
+            "spPct4",
+            "spRaw1",
+            "spRaw2",
+            "spRaw3",
+            "spRaw4",
+        }
+        remaining_keys = [
+            key
+            for key, value in result.totals.items()
+            if key not in STRUCTURAL_KEYS
+            and key not in excluded_component_keys
+            and is_number(value)
+            and not math.isclose(value, 0.0, abs_tol=1e-9)
+        ]
+        for key in sorted(remaining_keys, key=str.casefold):
+            rows.append((normalize_stat_key(key), format_number(result.totals[key])))
+
+        if not rows:
+            self.stats_tree.insert("", tk.END, values=("No computed stats yet.", ""))
             return
 
-        for key in keys:
-            self.stats_tree.insert("", tk.END, values=(normalize_stat_key(key), format_number(result.totals[key])))
+        for label, value in rows:
+            self.stats_tree.insert("", tk.END, values=(label, value))
 
     @staticmethod
     def _format_bonus_dict(bonus: dict[str, float]) -> str:
@@ -5542,53 +6068,145 @@ class WynnBuildTesterApp(tk.Tk):
 
 
 def run_self_test(engine: WynnBuildEngine) -> int:
-    if not math.isclose(engine._skill_effect_percentage("def", 150), 70.0, abs_tol=0.1):
-        raise AssertionError("Defence scaling no longer matches the current skill-point curve.")
-    if not math.isclose(engine._skill_effect_percentage("agi", 150), 76.8, abs_tol=0.1):
-        raise AssertionError("Agility scaling no longer matches the current skill-point curve.")
-    if not math.isclose(engine._intelligence_spell_cost_reduction_percentage(150), 50.0, abs_tol=0.05):
-        raise AssertionError("Intelligence spell-cost reduction no longer matches the current skill-point curve.")
+    def assert_close(
+        actual: float,
+        expected: float,
+        label: str,
+        *,
+        rel_tol: float = 1e-9,
+        abs_tol: float = 1e-6,
+    ) -> None:
+        if not math.isclose(actual, expected, rel_tol=rel_tol, abs_tol=abs_tol):
+            raise AssertionError(f"{label} mismatch: expected {expected}, got {actual}")
 
-    sample_totals = {"hp": 1000.0}
-    sample_skills = {"str": 0, "dex": 0, "int": 0, "def": 150, "agi": 150}
-    expected_multiplier = (
-        (engine._skill_effect_percentage("agi", sample_skills["agi"]) / 100.0) * 0.1
-    ) + (
-        (1.0 - (engine._skill_effect_percentage("agi", sample_skills["agi"]) / 100.0))
-        * (1.0 - (engine._skill_effect_percentage("def", sample_skills["def"]) / 100.0))
+    if level_to_skill_points(1) != 0:
+        raise AssertionError("Level 1 should have 0 allocatable base skill points.")
+    if level_to_skill_points(100) != 198:
+        raise AssertionError("Level 100 should have 198 allocatable base skill points.")
+    if level_to_skill_points(101) != 200 or level_to_skill_points(121) != 200:
+        raise AssertionError("Levels 101-121 should share the 200-point cap.")
+    if level_to_hp_base(1) != 10 or level_to_hp_base(100) != 505 or level_to_hp_base(101) != 510 or level_to_hp_base(121) != 610:
+        raise AssertionError("Base HP no longer matches the live beta level curve.")
+
+    assert_close(engine._skill_effect_percentage("def", 150), skill_points_to_percentage(150) * SKILLPOINT_FINAL_MULTIPLIERS["def"] * 100.0, "Defense scaling")
+    assert_close(engine._skill_effect_percentage("agi", 150), skill_points_to_percentage(150) * SKILLPOINT_FINAL_MULTIPLIERS["agi"] * 100.0, "Agility scaling")
+    assert_close(engine._intelligence_spell_cost_reduction_percentage(150), 50.0, "Intelligence spell-cost reduction", abs_tol=1e-9)
+
+    assert_close(raw_to_pct(100.0, 0.5), 150.0, "raw_to_pct positive")
+    assert_close(raw_to_pct(-100.0, 0.5), -50.0, "raw_to_pct negative")
+    assert_close(raw_to_pct_uncapped(100.0, -0.25), 75.0, "raw_to_pct_uncapped positive")
+    assert_close(raw_to_pct_uncapped(-100.0, -0.25), -125.0, "raw_to_pct_uncapped negative")
+
+    synthetic_totals = {
+        "hp": 1000.0,
+        "hpBonus": 500.0,
+        "hprRaw": 200.0,
+        "hprPct": 50.0,
+        "mr": 10.0,
+        "eDef": 100.0,
+        "eDefPct": 20.0,
+        "rDefPct": 10.0,
+        "ls": 120.0,
+        "ms": 30.0,
+        "atkTier": 1.0,
+    }
+    synthetic_skills = {"str": 0, "dex": 0, "int": 150, "def": 120, "agi": 90}
+    synthetic_weapon = {"type": "bow", "atkSpd": "NORMAL"}
+    synthetic_derived = engine._build_derived_stats(synthetic_totals, synthetic_skills, synthetic_weapon, 105)
+    synthetic_total_hp = level_to_hp_base(105) + synthetic_totals["hp"] + synthetic_totals["hpBonus"]
+    synthetic_def_pct = skill_points_to_percentage(synthetic_skills["def"]) * SKILLPOINT_FINAL_MULTIPLIERS["def"]
+    synthetic_agi_pct = skill_points_to_percentage(synthetic_skills["agi"]) * SKILLPOINT_FINAL_MULTIPLIERS["agi"]
+    synthetic_def_mult = 2.0 - CLASS_DEFENSE_MULTIPLIERS["bow"]
+    synthetic_agi_reduction = (100.0 - DEFAULT_AGILITY_DEFENSE) / 100.0
+    synthetic_with_agi_denominator = (
+        (synthetic_agi_reduction * synthetic_agi_pct)
+        + ((1.0 - synthetic_agi_pct) * (1.0 - synthetic_def_pct))
+    ) * synthetic_def_mult
+    synthetic_no_agi_denominator = (1.0 - synthetic_def_pct) * synthetic_def_mult
+    synthetic_hpr_total = raw_to_pct(synthetic_totals["hprRaw"], synthetic_totals["hprPct"] / 100.0)
+    assert_close(synthetic_derived["hp_total"], synthetic_total_hp, "Synthetic total HP")
+    assert_close(synthetic_derived["effective_hp"], synthetic_total_hp / synthetic_with_agi_denominator, "Synthetic effective HP")
+    assert_close(synthetic_derived["effective_hp_no_agi"], synthetic_total_hp / synthetic_no_agi_denominator, "Synthetic effective HP without agility")
+    assert_close(synthetic_derived["hpr_total"], synthetic_hpr_total, "Synthetic HPR total")
+    assert_close(synthetic_derived["effective_hpr"], synthetic_hpr_total / synthetic_with_agi_denominator, "Synthetic effective HPR")
+    assert_close(synthetic_derived["e_def_total"], raw_to_pct_uncapped(100.0, 0.30), "Synthetic earth defense total")
+    assert_close(synthetic_derived["mr_total"], 35.0, "Synthetic mana regen total")
+    assert_close(synthetic_derived["life_per_hit"], 16.0, "Synthetic life per hit")
+    assert_close(synthetic_derived["mana_per_hit"], 4.0, "Synthetic mana per hit")
+
+    spell_totals = {"spRaw1": -3.0, "spPct1": 20.0, "spRaw4": 2.0, "spPct4": -10.0}
+    spell_skills = {"str": 0, "dex": 0, "int": 150, "def": 0, "agi": 0}
+    wand_weapon = {"type": "wand", "atkSpd": "NORMAL"}
+    spell_derived = engine._build_derived_stats(spell_totals, spell_skills, wand_weapon, 121)
+    assert_close(spell_derived["spell_cost_1"], ((35.0 * 0.5) - 3.0) * 1.2, "Spell 1 cost")
+    assert_close(spell_derived["spell_cost_4"], ((30.0 * 0.5) + 2.0) * 0.9, "Spell 4 cost")
+
+    simple_weapon = {
+        "type": "spear",
+        "atkSpd": "NORMAL",
+        "averageDps": 300.0,
+        "nDam": "100-100",
+        "eDam": "50-50",
+        "tDam": "0-0",
+        "wDam": "0-0",
+        "fDam": "0-0",
+        "aDam": "0-0",
+    }
+    simple_base = {
+        element: DamageRange.from_string(simple_weapon.get(f"{element}Dam"))
+        for element in ELEMENT_ORDER
+    }
+    simple_totals = {"damRaw": 30.0, "rDamRaw": 20.0, "eDamRaw": 5.0, "critDamPct": 50.0}
+    zero_skills = {skill: 0 for skill in SKILLS}
+    melee_noncrit = engine._finish_damage_pipeline(simple_base, simple_totals, zero_skills, "melee", False, 1.0, 1.0)
+    melee_crit = engine._finish_damage_pipeline(simple_base, simple_totals, zero_skills, "melee", True, 1.0, 1.0)
+    assert_close(melee_noncrit["n"].minimum, 120.0, "Proportional raw neutral melee")
+    assert_close(melee_noncrit["e"].minimum, 85.0, "Proportional raw earth melee")
+    assert_close(melee_crit["n"].minimum, 300.0, "Crit neutral melee")
+    assert_close(melee_crit["e"].minimum, 212.5, "Crit earth melee")
+    generic_spell_base = engine._build_generic_spell_damage_map(simple_weapon, simple_base)
+    assert_close(generic_spell_base["n"].minimum, 200.0, "Spell heuristic neutral base")
+    assert_close(generic_spell_base["e"].minimum, 100.0, "Spell heuristic earth base")
+
+    fixture_one = engine.build_result({"Weapon": "Abhorrence"}, "hp_total", build_level=121)
+    if fixture_one.warnings:
+        raise AssertionError(f"Unexpected warnings for Abhorrence fixture: {fixture_one.warnings}")
+    assert_close(fixture_one.derived_stats["hp_total"], 610.0, "Abhorrence total HP")
+    assert_close(fixture_one.derived_stats["effective_hp"], 1012.3795044129232, "Abhorrence EHP")
+    assert_close(fixture_one.derived_stats["mr_total"], 25.0, "Abhorrence mana regen total")
+    assert_close(total_damage_range(fixture_one.damage_profiles["Melee"].noncrit).minimum, 1070.4847378669224, "Abhorrence melee min")
+    assert_close(total_damage_range(fixture_one.damage_profiles["Melee"].noncrit).maximum, 1531.469834086208, "Abhorrence melee max")
+    assert_close(engine.metric_value_from_result(fixture_one, "melee_avg"), 1777.720395356041, "Abhorrence melee average")
+
+    fixture_two = engine.build_result(
+        {
+            "Weapon": "Abhorrence",
+            "Boots": "Abysso Galoshes",
+            "Bracelet": "Asher's Relic",
+            "Ring 1": "Aluminium",
+            "Helmet": "Advancement",
+        },
+        "hp_total",
+        build_level=121,
     )
-    expected_ehp = sample_totals["hp"] / expected_multiplier
-    if not math.isclose(engine._effective_hp_value(sample_totals, sample_skills), expected_ehp, rel_tol=1e-9):
-        raise AssertionError("Effective HP is no longer using the wiki dodge-plus-defence interaction.")
-
-    thunder_crit_boost = engine._damage_boost_percent(
-        "t",
-        "melee",
-        {},
-        {"str": 0, "dex": 100, "int": 0, "def": 0, "agi": 0},
-        True,
-    )
-    if not math.isclose(thunder_crit_boost, 230.0, abs_tol=0.1):
-        raise AssertionError("Thunder critical scaling no longer matches the wiki dexterity interaction.")
-
-    selections = {}
-    for slot_label, _slot_type in SLOT_CONFIGS:
-        options = engine.slot_options[slot_label]
-        if options:
-            selections[slot_label] = options[0]
-
-    result = engine.build_result(selections, "hp_total")
+    if fixture_two.warnings:
+        raise AssertionError(f"Unexpected warnings for mixed fixture: {fixture_two.warnings}")
+    assert_close(fixture_two.derived_stats["hp_total"], 2265.0, "Mixed fixture total HP")
+    assert_close(fixture_two.derived_stats["effective_hp"], 3759.0812745824114, "Mixed fixture EHP")
+    assert_close(fixture_two.derived_stats["hpr_total"], 2.25, "Mixed fixture HPR total")
+    assert_close(fixture_two.derived_stats["effective_hpr"], 3.7341866966050445, "Mixed fixture effective HPR")
+    assert_close(fixture_two.derived_stats["t_def_total"], 56.0, "Mixed fixture thunder defense")
+    assert_close(fixture_two.derived_stats["w_def_total"], 35.0, "Mixed fixture water defense")
+    assert_close(fixture_two.derived_stats["mr_total"], 29.0, "Mixed fixture mana regen total")
+    assert_close(fixture_two.derived_stats["mana_per_hit"], 7.2, "Mixed fixture mana per hit")
+    assert_close(total_damage_range(fixture_two.damage_profiles["Melee"].noncrit).minimum, 1085.4847378669224, "Mixed fixture melee min")
+    assert_close(total_damage_range(fixture_two.damage_profiles["Melee"].noncrit).maximum, 1566.469834086208, "Mixed fixture melee max")
+    assert_close(engine.metric_value_from_result(fixture_two, "melee_avg"), 1811.8816450280829, "Mixed fixture melee average")
 
     print("Loaded items:", len(engine.items))
-    print("Selected weapon:", result.weapon["_label"] if result.weapon else "None")
-    print("Level requirement:", result.level_requirement)
-    print("Gear health bonus:", format_number(result.gear_health_bonus))
-    print("Auto allocation:", ", ".join(f"{skill}={result.base_skills[skill]}" for skill in SKILLS))
-    print("Equip order:", " -> ".join(result.equip_order or []))
-    if result.damage_profiles:
-        melee = result.damage_profiles["Melee"]
-        print("Melee total:", format_damage_range(total_damage_range(melee.noncrit)))
-    print("Warnings:", len(result.warnings))
+    print("Build helper curve checks:", "ok")
+    print("Damage pipeline regression checks:", "ok")
+    print("Parity fixtures:", "ok")
     return 0
 
 
